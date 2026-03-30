@@ -32,6 +32,7 @@ pack_runnable(tcp_client_esp32 tcp_client_esp32 eavmlib estdlib avm_network avm_
 pack_runnable(tcp_server_blink tcp_server_blink eavmlib estdlib avm_network avm_esp32)
 pack_runnable(esp_random esp_random eavmlib estdlib avm_esp32)
 pack_runnable(esp_nvs esp_nvs eavmlib avm_esp32)
+pack_runnable(pcm5102 pcm5102 eavmlib estdlib avm_esp32)
 pack_runnable(sht31 sht31 eavmlib estdlib avm_esp32)
 pack_runnable(sx127x sx127x eavmlib estdlib avm_esp32)
 pack_runnable(reformat_nvs reformat_nvs eavmlib avm_esp32)

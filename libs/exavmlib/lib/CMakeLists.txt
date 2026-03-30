@@ -30,6 +30,7 @@ set(ELIXIR_MODULES
     Console
     GPIO
     I2C
+    I2S
     Integer
     LEDC
     Access

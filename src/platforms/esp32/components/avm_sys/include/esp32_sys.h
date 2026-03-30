@@ -69,6 +69,11 @@ struct ESP32PlatformData
     struct SyncList sockets;
     struct ListHead ready_connections;
 
+    /* i2s_driver */
+#ifdef CONFIG_AVM_ENABLE_I2S_PORT_DRIVER
+    struct SyncList i2s_channels;
+#endif
+
 #ifndef AVM_NO_SMP
     Mutex *entropy_mutex;
 #endif

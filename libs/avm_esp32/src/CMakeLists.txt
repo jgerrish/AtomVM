@@ -28,6 +28,7 @@ set(ERLANG_MODULES
     esp_dac
     gpio
     i2c
+    i2s
     ledc
     spi
     uart

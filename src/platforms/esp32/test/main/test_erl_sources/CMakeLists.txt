@@ -67,6 +67,7 @@ compile_erlang(test_list_to_atom)
 compile_erlang(test_list_to_binary)
 compile_erlang(test_md5)
 compile_erlang(test_crypto)
+compile_erlang(test_i2s)
 compile_erlang(test_monotonic_time)
 compile_erlang(test_mount)
 compile_erlang(test_net)
@@ -89,6 +90,7 @@ set(erlang_test_beams
     test_list_to_binary.beam
     test_md5.beam
     test_crypto.beam
+    test_i2s.beam
     test_monotonic_time.beam
     test_mount.beam
     test_net.beam
