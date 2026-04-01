@@ -269,26 +269,19 @@ void i2s_driver_init(GlobalContext *global)
 
 void i2s_driver_do_channel_delete(i2s_chan_handle_t *channel)
 {
-    /* This relies on the ordering of the I2S state machine, so it
-     * might be a little fragile.  But it is the same method used
-     * in the esp-idf code. It relies on private headers and
-     * access to atomic_load. */
-    /* if (atomic_load(channel->channel->state) >= I2S_CHAN_STATE_RUNNING) */
+    i2s_chan_info_t chan_info;
 
-    /* We just log the result of the i2s_channel_disable call.
-     * It's not a good practice, but we don't have clean access to
-     * the state of the I2S channel without bringing in private
-     * headers.  The only failure path in i2s_channel_disable
-     * right now is if the channel not disabled, but that may
-     * change in the future, so it's still a bad idea to ignore
-     * the error.
-     *
-     * We could also keep a separate state machine to track
-     * disabled/enabled.
-     */
-    esp_err_t res = i2s_channel_disable(*channel);
-    if (UNLIKELY(res != ESP_OK)) {
-        ESP_LOGW(TAG, "I2S attempted to disable channel that was not enabled");
+    /* We can use i2s_channel_get_info to get channel information from
+     * a handle.  We can then use that to see if a channel is
+     * enabled. */
+    if (UNLIKELY(i2s_channel_get_info(*channel, &chan_info) != ESP_OK)) {
+        ESP_LOGW(TAG, "I2S unable to get channel info");
+    }
+
+    if (chan_info.is_enabled) {
+        if (UNLIKELY(i2s_channel_disable(*channel) != ESP_OK)) {
+            ESP_LOGW(TAG, "I2S attempted to disable channel that was not enabled");
+        }
     }
 
     i2s_del_channel(*channel);
