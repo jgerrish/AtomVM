@@ -83,6 +83,7 @@
     dwarf_label/2,
     dwarf_function/3,
     dwarf_line/2,
+    dwarf_variables/2,
     dwarf_ctx_register/0,
     dwarf_register_number/1
 ]).
@@ -170,11 +171,11 @@
     stream_module :: module(),
     stream :: stream(),
     offset :: non_neg_integer(),
-    branches :: [{non_neg_integer(), non_neg_integer(), non_neg_integer()}],
+    branches :: #{integer() | reference() => [{non_neg_integer(), tuple()}]},
     jump_table_start :: non_neg_integer(),
     available_regs :: non_neg_integer(),
     used_regs :: non_neg_integer(),
-    labels :: [{integer() | reference(), integer()}],
+    labels :: #{integer() | reference() => integer()},
     variant :: non_neg_integer(),
     regs :: jit_regs:regs()
 }).

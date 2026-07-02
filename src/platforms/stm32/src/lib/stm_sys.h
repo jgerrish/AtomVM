@@ -26,10 +26,14 @@
 
 #include "stm32_hal_platform.h"
 
+#ifdef ATOMVM_HAS_MBEDTLS
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#endif
+
 #define STM32_ATOM globalcontext_make_atom(ctx->global, ATOM_STR("\x5", "stm32"))
 
-/* Define macros for data and instruction barriers for sys_init_icache()
- * See: ARM V7-M Architecture Reference Manual :: https://static.docs.arm.com/ddi0403/eb/DDI0403E_B_armv7m_arm.pdf */
+/* Define macros for data and instruction barriers for sys_init_icache() */
 // Ensure write is visible
 #define __dsb asm __volatile__("dsb" :: \
                                    : "memory");
@@ -47,6 +51,13 @@ struct LockedPin
 struct STM32PlatformData
 {
     struct ListHead locked_pins;
+#ifdef ATOMVM_HAS_MBEDTLS
+    RNG_HandleTypeDef rng;
+    mbedtls_entropy_context entropy_ctx;
+    mbedtls_ctr_drbg_context random_ctx;
+    bool entropy_is_initialized;
+    bool random_is_initialized;
+#endif
 };
 
 void sys_init_icache(void);

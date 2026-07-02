@@ -39,6 +39,7 @@ start() ->
 %% Examples:
 %%   "armv6m" -> {"armv6m", ?JIT_VARIANT_PIC}
 %%   "armv6m+float32" -> {"armv6m", ?JIT_VARIANT_PIC + ?JIT_VARIANT_FLOAT32}
+%%   "armv6m+thumb2" -> {"armv6m", ?JIT_VARIANT_PIC + ?JIT_VARIANT_THUMB2}
 %%   "x86_64" -> {"x86_64", ?JIT_VARIANT_PIC}
 parse_target(Target) ->
     case string:split(Target, "+", all) of
@@ -48,7 +49,9 @@ parse_target(Target) ->
             RequestedVariant = lists:foldl(
                 fun(Variant, Acc) ->
                     case Variant of
-                        "float32" -> Acc + ?JIT_VARIANT_FLOAT32
+                        "float32" -> Acc + ?JIT_VARIANT_FLOAT32;
+                        "thumb2" -> Acc + ?JIT_VARIANT_THUMB2;
+                        _ -> error({unsupported_variant, Variant})
                     end
                 end,
                 ?JIT_VARIANT_PIC,
@@ -109,6 +112,21 @@ compile(Target, Dir, Dwarf, Path) ->
                     fun(_LineRef) -> false end
             end,
 
+        % Parse debug info (DbgB chunk) for variable name information
+        DebugInfoResolver =
+            case lists:keyfind("DbgB", 1, InitialChunks) of
+                {"DbgB", DbgBChunk} ->
+                    DebugInfoMap = parse_dbgb_chunk(DbgBChunk, LiteralResolver, AtomResolver),
+                    fun(Index) ->
+                        case DebugInfoMap of
+                            #{Index := VarMappings} -> VarMappings;
+                            _ -> false
+                        end
+                    end;
+                false ->
+                    fun(_Index) -> false end
+            end,
+
         % Parse target to extract arch and variant
         {BaseTarget, RequestedVariant} = parse_target(Target),
         Backend = list_to_atom("jit_" ++ BaseTarget),
@@ -120,6 +138,9 @@ compile(Target, Dir, Dwarf, Path) ->
                 "armv6m" -> ?JIT_ARCH_ARMV6M;
                 "riscv32" -> ?JIT_ARCH_RISCV32;
                 "riscv64" -> ?JIT_ARCH_RISCV64;
+                "arm32" -> ?JIT_ARCH_ARM32;
+                "wasm32" -> ?JIT_ARCH_WASM32;
+                "xtensa" -> ?JIT_ARCH_XTENSA;
                 _ -> error({unsupported_target, Target})
             end,
 
@@ -132,7 +153,9 @@ compile(Target, Dir, Dwarf, Path) ->
         Stream2 =
             case Dwarf of
                 true ->
-                    Stream0 = jit_dwarf:new(Backend, Module, jit_stream_binary, 0, LineResolver),
+                    Stream0 = jit_dwarf:new(
+                        Backend, Module, jit_stream_binary, 0, LineResolver, RequestedVariant
+                    ),
                     Backend:new(RequestedVariant, jit_dwarf, Stream0);
                 false ->
                     Backend:new(
@@ -146,6 +169,7 @@ compile(Target, Dir, Dwarf, Path) ->
             LiteralResolver,
             TypeResolver,
             ImportedFunctionResolver,
+            DebugInfoResolver,
             Backend,
             Stream2
         ),
@@ -257,8 +281,9 @@ parse_imported_functions_chunk0(
     ImportedFunction = {Module, Function, Arity},
     parse_imported_functions_chunk0(N - 1, Rest, AtomResolver, [ImportedFunction | Acc]).
 
-%% Version (from beam_types.hrl)
--define(BEAM_TYPES_VERSION, 3).
+%% Versions (from beam_types.hrl). v3 is OTP < 29, v4 is OTP >= 29
+-define(BEAM_TYPES_VERSION_V3, 3).
+-define(BEAM_TYPES_VERSION_V4, 4).
 
 %% Type chunk constants (from beam_types.erl)
 -define(BEAM_TYPE_ATOM, (1 bsl 0)).
@@ -274,21 +299,27 @@ parse_imported_functions_chunk0(
 -define(BEAM_TYPE_REFERENCE, (1 bsl 10)).
 -define(BEAM_TYPE_TUPLE, (1 bsl 11)).
 
--define(BEAM_TYPE_HAS_LOWER_BOUND, (1 bsl 12)).
--define(BEAM_TYPE_HAS_UPPER_BOUND, (1 bsl 13)).
--define(BEAM_TYPE_HAS_UNIT, (1 bsl 14)).
-
-type_resolver(<<Version:32, _Count:32, TypeData/binary>>) when Version =:= ?BEAM_TYPES_VERSION ->
-    Types = parse_type_entries(TypeData, []),
+type_resolver(<<Version:32, _Count:32, TypeData/binary>>) when
+    Version =:= ?BEAM_TYPES_VERSION_V3; Version =:= ?BEAM_TYPES_VERSION_V4
+->
+    Types = parse_type_entries(Version, TypeData, []),
     fun(Index) -> lists:nth(Index + 1, Types) end;
 type_resolver(_) ->
     fun(_) -> any end.
 
-parse_type_entries(<<>>, Acc) ->
+parse_type_entries(_Version, <<>>, Acc) ->
     lists:reverse(Acc);
-parse_type_entries(
-    <<0:1, HasUnit:1, HasUpperBound:1, HasLowerBound:1, TypeBits:12, Rest0/binary>>, Acc
-) ->
+parse_type_entries(?BEAM_TYPES_VERSION_V3 = Version, <<Header:16, Rest0/binary>>, Acc) ->
+    %% v3: bit15 unused, bits 14/13/12 = unit/upper/lower flags, bits 0..11 type.
+    <<0:1, HasUnit:1, HasUpperBound:1, HasLowerBound:1, TypeBits:12>> = <<Header:16>>,
+    parse_type_entry(Version, TypeBits, HasLowerBound, HasUpperBound, HasUnit, Rest0, Acc);
+parse_type_entries(?BEAM_TYPES_VERSION_V4 = Version, <<Header:16, Rest0/binary>>, Acc) ->
+    %% v4: bits 15/14/13 = unit/upper/lower flags, bits 0..12 type (bit 12 is
+    %% BEAM_TYPE_RECORD, which we treat as `any`).
+    <<HasUnit:1, HasUpperBound:1, HasLowerBound:1, TypeBits:13>> = <<Header:16>>,
+    parse_type_entry(Version, TypeBits, HasLowerBound, HasUpperBound, HasUnit, Rest0, Acc).
+
+parse_type_entry(Version, TypeBits, HasLowerBound, HasUpperBound, HasUnit, Rest0, Acc) ->
     {Rest, LowerBound, UpperBound, Unit} = parse_extra(
         HasLowerBound, HasUpperBound, HasUnit, Rest0, '-inf', '+inf', 1
     ),
@@ -325,7 +356,7 @@ parse_type_entries(
             _ ->
                 any
         end,
-    parse_type_entries(Rest, [Type | Acc]).
+    parse_type_entries(Version, Rest, [Type | Acc]).
 
 parse_extra(1, HasUpperBound, HasUnit, <<Value:64/signed, Rest/binary>>, '-inf', '+inf', 1) ->
     parse_extra(0, HasUpperBound, HasUnit, Rest, Value, '+inf', 1);
@@ -343,13 +374,20 @@ update_avmn_chunk_with_elf(Info, ElfBinary, TextSectionOffset) ->
     UpdatedInfo = <<LabelsCount:32, Version:16, ArchCount:16, Arch:16, Variant:16, NewOffset:32>>,
     <<(byte_size(UpdatedInfo)):32, UpdatedInfo/binary, ElfBinary/binary>>.
 
+-define(BEAMFILE_EXECUTABLE_LINE, 16#01).
+
 %% @doc Resolve a line reference to filename and line number
+%% LineRef is the line index (1-based). If Flags indicates executable_line is present,
+%% the line table includes entries for both regular line and executable_line instructions.
 resolve_line_info(
     Module,
-    <<Version:32, _Flags:32, _NumInstr:32, NumRefs:32, _NumFilenames:32, Rest/binary>>,
+    <<Version:32, Flags:32, _NumInstr:32, NumRefs:32, _NumFilenames:32, Rest/binary>>,
     LineRef
 ) when Version =:= 0, LineRef > 0, LineRef =< NumRefs ->
-    resolve_line_info0(Module, 1, 0, LineRef, NumRefs, Rest, false);
+    HasExecutableLine = (Flags band ?BEAMFILE_EXECUTABLE_LINE) =/= 0,
+    %% NumInstr is the total number of line instruction entries (line + executable_line)
+    %% NumRefs is the number of unique line location entries in the table
+    resolve_line_info0(Module, 1, 0, LineRef, NumRefs, Rest, false, HasExecutableLine);
 resolve_line_info(_Module, <<Version:32, _/binary>>, _) when Version =/= 0 ->
     io:format("resolve_line_info -- unknown Line table version (~p)\n", [Version]),
     false;
@@ -368,7 +406,14 @@ resolve_line_info(
     false.
 
 resolve_line_info0(
-    Module, CurrentLineRef, _CurrentLocationIx, _LineRef, NumRefs, LocationData, {Line, LocationIx}
+    Module,
+    CurrentLineRef,
+    _CurrentLocationIx,
+    _LineRef,
+    NumRefs,
+    LocationData,
+    {Line, LocationIx},
+    _HasExecutableLine
 ) when CurrentLineRef > NumRefs ->
     resolve_line_info1(Module, LocationIx, LocationData, Line);
 resolve_line_info0(
@@ -378,11 +423,19 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<_:4, ?COMPACT_INTEGER:4, _/binary>> = Bin,
-    false
+    false,
+    _HasExecutableLine
 ) ->
     {Line, Rest} = jit:decode_value64(Bin),
     resolve_line_info0(
-        Module, LineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, {Line, CurrentLocationIx}
+        Module,
+        LineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        {Line, CurrentLocationIx},
+        _HasExecutableLine
     );
 resolve_line_info0(
     Module,
@@ -391,10 +444,20 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<_:4, ?COMPACT_INTEGER:4, _/binary>> = Bin,
-    Acc
+    Acc,
+    HasExecutableLine
 ) ->
     {_Line, Rest} = jit:decode_value64(Bin),
-    resolve_line_info0(Module, CurrentLineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, Acc);
+    resolve_line_info0(
+        Module,
+        CurrentLineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        Acc,
+        HasExecutableLine
+    );
 resolve_line_info0(
     Module,
     LineRef,
@@ -402,11 +465,19 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<Val:3, ?COMPACT_LARGE_INTEGER_11BITS:5, NextByte, Rest/binary>>,
-    false
+    false,
+    _HasExecutableLine
 ) ->
     Line = (Val bsl 8) bor NextByte,
     resolve_line_info0(
-        Module, LineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, {Line, CurrentLocationIx}
+        Module,
+        LineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        {Line, CurrentLocationIx},
+        _HasExecutableLine
     );
 resolve_line_info0(
     Module,
@@ -415,9 +486,19 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<_Val:3, ?COMPACT_LARGE_INTEGER_11BITS:5, _NextByte, Rest/binary>>,
-    Acc
+    Acc,
+    HasExecutableLine
 ) ->
-    resolve_line_info0(Module, CurrentLineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, Acc);
+    resolve_line_info0(
+        Module,
+        CurrentLineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        Acc,
+        HasExecutableLine
+    );
 resolve_line_info0(
     Module,
     LineRef,
@@ -425,10 +506,18 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<Size0:3, ?COMPACT_LARGE_INTEGER_NBITS:5, Line:(8 * (Size0 + 2))/signed, Rest/binary>>,
-    false
+    false,
+    _HasExecutableLine
 ) ->
     resolve_line_info0(
-        Module, LineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, {Line, CurrentLocationIx}
+        Module,
+        LineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        {Line, CurrentLocationIx},
+        _HasExecutableLine
     );
 resolve_line_info0(
     Module,
@@ -437,9 +526,19 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<Size0:3, ?COMPACT_LARGE_INTEGER_NBITS:5, _:(8 * (Size0 + 2))/signed, Rest/binary>>,
-    Acc
+    Acc,
+    HasExecutableLine
 ) ->
-    resolve_line_info0(Module, CurrentLineRef + 1, CurrentLocationIx, LineRef, NumRefs, Rest, Acc);
+    resolve_line_info0(
+        Module,
+        CurrentLineRef + 1,
+        CurrentLocationIx,
+        LineRef,
+        NumRefs,
+        Rest,
+        Acc,
+        HasExecutableLine
+    );
 resolve_line_info0(
     Module,
     CurrentLineRef,
@@ -447,10 +546,13 @@ resolve_line_info0(
     LineRef,
     NumRefs,
     <<_:4, AtomTag:4, _/binary>> = Bin,
-    Acc
+    Acc,
+    HasExecutableLine
 ) when AtomTag =:= ?COMPACT_LARGE_ATOM; AtomTag =:= ?COMPACT_ATOM ->
     {NewLocationIx, Rest} = jit:decode_value64(Bin),
-    resolve_line_info0(Module, CurrentLineRef, NewLocationIx, LineRef, NumRefs, Rest, Acc).
+    resolve_line_info0(
+        Module, CurrentLineRef, NewLocationIx, LineRef, NumRefs, Rest, Acc, HasExecutableLine
+    ).
 
 resolve_line_info1(Module, 0, _LocationData, Line) ->
     {ok, <<(atom_to_binary(Module, utf8))/binary, ".erl">>, Line};
@@ -458,3 +560,127 @@ resolve_line_info1(_Module, 1, <<Size:16, Filename:Size/binary, _/binary>>, Line
     {ok, Filename, Line};
 resolve_line_info1(Module, N, <<Size:16, _:Size/binary, Rest/binary>>, Line) ->
     resolve_line_info1(Module, N - 1, Rest, Line).
+
+-define(DBGB_CALL_OPCODE, 4).
+-define(DBGB_V1_ENTRY_FRAME_SIZE, 0).
+-define(DBGB_V1_ENTRY_VAR_MAPPINGS, 1).
+
+%% @doc Parse DbgB chunk and return a map #{Index => [{VarName, Location}]}
+%% where VarName is a binary string and Location is {x,N}, {y,N}, or {value,V}.
+%% @end
+% Version 0 (OTP 28): Each item is {call, FrameSize, {list, [VarName, Where, ...]}}
+parse_dbgb_chunk(
+    <<0:32, NumItems:32, _NumVars:32, Data/binary>>,
+    LiteralResolver,
+    AtomResolver
+) ->
+    dbgb_decode_items(Data, LiteralResolver, AtomResolver, 1, NumItems, #{});
+% Version 1 (OTP 29+): Items delimited by frame_size entries
+parse_dbgb_chunk(
+    <<1:32, _NumItems:32, _NumTerms:32, Data/binary>>,
+    LiteralResolver,
+    AtomResolver
+) ->
+    Entries = dbgb_v1_decode_entries(Data, LiteralResolver, AtomResolver),
+    %% Group entries by item (delimited by frame_size), fold right like OTP does
+    {Items, _} = lists:foldr(
+        fun
+            ({?DBGB_V1_ENTRY_FRAME_SIZE, _}, {ItemsAcc, CurrentVars}) ->
+                {[CurrentVars | ItemsAcc], []};
+            ({?DBGB_V1_ENTRY_VAR_MAPPINGS, {list, List}}, {ItemsAcc, CurrentVars}) ->
+                {ItemsAcc, dbgb_decode_var_mappings(List) ++ CurrentVars};
+            ({_OtherType, _}, Acc) ->
+                Acc
+        end,
+        {[], []},
+        Entries
+    ),
+    lists:foldl(
+        fun
+            ({_Ix, []}, Map) -> Map;
+            ({Ix, Vars}, Map) -> Map#{Ix => Vars}
+        end,
+        #{},
+        lists:zip(lists:seq(1, length(Items)), Items)
+    ).
+
+%% Version 1: Decode all {call, EntryType, Value} entries
+dbgb_v1_decode_entries(<<>>, _LiteralResolver, _AtomResolver) ->
+    [];
+dbgb_v1_decode_entries(
+    <<?DBGB_CALL_OPCODE, Rest0/binary>>, LiteralResolver, AtomResolver
+) ->
+    {EntryType, Rest1} = dbgb_decode_arg(Rest0, LiteralResolver, AtomResolver),
+    {Value, Rest2} = dbgb_decode_arg(Rest1, LiteralResolver, AtomResolver),
+    [{EntryType, Value} | dbgb_v1_decode_entries(Rest2, LiteralResolver, AtomResolver)].
+
+dbgb_decode_items(_Data, _LiteralResolver, _AtomResolver, Index, NumItems, Map) when
+    Index > NumItems
+->
+    Map;
+dbgb_decode_items(
+    <<?DBGB_CALL_OPCODE, Rest0/binary>>, LiteralResolver, AtomResolver, Index, NumItems, Map
+) ->
+    {_FrameSize, Rest1} = dbgb_decode_arg(Rest0, LiteralResolver, AtomResolver),
+    {{list, VarList}, Rest2} = dbgb_decode_arg(Rest1, LiteralResolver, AtomResolver),
+    VarMappings = dbgb_decode_var_mappings(VarList),
+    NewMap =
+        case VarMappings of
+            [] -> Map;
+            _ -> Map#{Index => VarMappings}
+        end,
+    dbgb_decode_items(Rest2, LiteralResolver, AtomResolver, Index + 1, NumItems, NewMap).
+
+%% @doc Decode variable mappings: [VarName, VarLoc, VarName, VarLoc, ...]
+%% VarName can be {literal, BinaryName} (normal vars) or {integer, N} (entry params)
+dbgb_decode_var_mappings([]) ->
+    [];
+dbgb_decode_var_mappings([{literal, VarName}, {x, N} | Rest]) ->
+    [{VarName, {x, N}} | dbgb_decode_var_mappings(Rest)];
+dbgb_decode_var_mappings([{literal, VarName}, {y, N} | Rest]) ->
+    [{VarName, {y, N}} | dbgb_decode_var_mappings(Rest)];
+dbgb_decode_var_mappings([{literal, VarName}, Value | Rest]) ->
+    [{VarName, {value, Value}} | dbgb_decode_var_mappings(Rest)];
+dbgb_decode_var_mappings([{integer, ParamIndex}, {x, N} | Rest]) ->
+    %% Entry function parameter: index is 1-based parameter number
+    Name = <<"_param", (integer_to_binary(ParamIndex))/binary>>,
+    [{Name, {x, N}} | dbgb_decode_var_mappings(Rest)];
+dbgb_decode_var_mappings([{integer, ParamIndex}, {y, N} | Rest]) ->
+    Name = <<"_param", (integer_to_binary(ParamIndex))/binary>>,
+    [{Name, {y, N}} | dbgb_decode_var_mappings(Rest)];
+dbgb_decode_var_mappings([{integer, _ParamIndex}, _Value | Rest]) ->
+    %% Skip entry parameters with non-register locations
+    dbgb_decode_var_mappings(Rest).
+
+%% @doc Decode a single compact-term encoded argument from DbgB data
+%% @returns {DecodedValue, RestBinary}
+% nil: atom index 0
+dbgb_decode_arg(<<0:4, 0:1, ?COMPACT_ATOM:3, Rest/binary>>, _LiteralResolver, _AtomResolver) ->
+    {nil, Rest};
+% Extended z-tag: list (SubTag=1)
+dbgb_decode_arg(<<1:4, 0:1, ?COMPACT_EXTENDED:3, Rest0/binary>>, LiteralResolver, AtomResolver) ->
+    {Count, Rest1} = dbgb_decode_arg(Rest0, LiteralResolver, AtomResolver),
+    {List, Rest2} = dbgb_decode_args(Count, Rest1, LiteralResolver, AtomResolver),
+    {{list, List}, Rest2};
+% Extended z-tag: literal reference (SubTag=4)
+dbgb_decode_arg(<<4:4, 0:1, ?COMPACT_EXTENDED:3, Rest0/binary>>, LiteralResolver, AtomResolver) ->
+    {Index, Rest1} = dbgb_decode_arg(Rest0, LiteralResolver, AtomResolver),
+    {{literal, LiteralResolver(Index)}, Rest1};
+% General case: tag is in the low 3 bits; jit:decode_value64/1 extracts the value
+% for all sizes (4-bit, 11-bit, multi-byte), ignoring the tag bits.
+dbgb_decode_arg(<<_:5, Tag:3, _/binary>> = Binary, LiteralResolver, AtomResolver) ->
+    {N, Rest} = jit:decode_value64(Binary),
+    {dbgb_tag_value(Tag, N, LiteralResolver, AtomResolver), Rest}.
+
+dbgb_decode_args(0, Rest, _LiteralResolver, _AtomResolver) ->
+    {[], Rest};
+dbgb_decode_args(N, Rest0, LiteralResolver, AtomResolver) ->
+    {Arg, Rest1} = dbgb_decode_arg(Rest0, LiteralResolver, AtomResolver),
+    {Args, Rest2} = dbgb_decode_args(N - 1, Rest1, LiteralResolver, AtomResolver),
+    {[Arg | Args], Rest2}.
+
+dbgb_tag_value(?COMPACT_LITERAL, N, _LiteralResolver, _AtomResolver) -> N;
+dbgb_tag_value(?COMPACT_INTEGER, N, _LiteralResolver, _AtomResolver) -> {integer, N};
+dbgb_tag_value(?COMPACT_ATOM, N, _LiteralResolver, AtomResolver) -> {atom, AtomResolver(N)};
+dbgb_tag_value(?COMPACT_XREG, N, _LiteralResolver, _AtomResolver) -> {x, N};
+dbgb_tag_value(?COMPACT_YREG, N, _LiteralResolver, _AtomResolver) -> {y, N}.

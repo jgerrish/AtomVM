@@ -26,7 +26,7 @@
 %% Asynchronous Receiver-Transmitter) operations across all supported
 %% platforms.
 %%
-%% Currently, only ESP32 provides a UART implementation.
+%% ESP32, RP2, STM32 and generic unix platforms provide UART implementations.
 %%
 %% <h3>Lifecycle</h3>
 %%
@@ -95,13 +95,13 @@
 % Open a UART port with the given configuration parameters.
 %
 % Returns a handle for subsequent read/write operations.
--callback open(Params :: params()) -> uart() | {error, Reason :: term()}.
+-callback open(Params :: params()) -> uart().
 
 % Open a UART port on the specified peripheral.
 %
 % Convenience wrapper that adds `{peripheral, Name}' to the
 % parameters and calls `open/1'.
--callback open(Name :: peripheral(), Params :: params()) -> uart() | {error, Reason :: term()}.
+-callback open(Name :: peripheral(), Params :: params()) -> uart().
 
 % Close a UART port and release its resources.
 -callback close(UART :: uart()) -> ok | {error, Reason :: term()}.

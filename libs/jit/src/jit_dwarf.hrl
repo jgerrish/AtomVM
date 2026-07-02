@@ -85,6 +85,7 @@
 -define(EM_X86_64, 62).
 -define(EM_AARCH64, 183).
 -define(EM_RISCV, 243).
+-define(EM_XTENSA, 94).
 -define(SHT_PROGBITS, 1).
 -define(SHT_SYMTAB, 2).
 -define(SHT_STRTAB, 3).
@@ -108,3 +109,6 @@
 -define(DWARF_A0_REG_RISCV, 10).
 % r0 register in ARM
 -define(DWARF_R0_REG_ARMV6M, 0).
+-define(DWARF_R0_REG_ARM32, 0).
+% a2 register in Xtensa (ctx is passed in a2)
+-define(DWARF_A2_REG_XTENSA, 2).

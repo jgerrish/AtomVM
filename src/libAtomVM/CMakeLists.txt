@@ -113,7 +113,7 @@ set(SOURCE_FILES
     valueshashtable.c
 )
 
-if(NOT AVM_DISABLE_JIT)
+if(NOT AVM_DISABLE_JIT OR AVM_ENABLE_PRECOMPILED)
     set(HEADER_FILES ${HEADER_FILES}
         jit.h
     )
@@ -189,6 +189,12 @@ endif()
 if (AVM_DISABLE_JIT_DWARF OR AVM_DISABLE_JIT)
     target_compile_definitions(libAtomVM PUBLIC AVM_NO_JIT_DWARF)
 endif()
+if (AVM_JIT_TARGET_ARCH STREQUAL "arm32")
+    target_compile_definitions(libAtomVM PUBLIC AVM_JIT_ARM32)
+endif()
+if (AVM_JIT_TARGET_ARCH MATCHES "thumb2")
+    target_compile_definitions(libAtomVM PUBLIC AVM_JIT_THUMB2)
+endif()
 
 if(HAVE_PLATFORM_SMP_H)
     target_compile_definitions(libAtomVM PUBLIC HAVE_PLATFORM_SMP_H)
@@ -255,6 +261,7 @@ define_if_function_exists(libAtomVM execve "unistd.h" PRIVATE HAVE_EXECVE)
 define_if_function_exists(libAtomVM tcgetattr "termios.h" PRIVATE HAVE_TCGETATTR)
 define_if_function_exists(libAtomVM closefrom "unistd.h" PRIVATE HAVE_CLOSEFROM)
 define_if_function_exists(libAtomVM getcwd "unistd.h" PUBLIC HAVE_GETCWD)
+define_if_function_exists(libAtomVM sched_yield "sched.h" PUBLIC HAVE_SCHED_YIELD)
 define_if_symbol_exists(libAtomVM POSIX_SPAWN_CLOEXEC_DEFAULT "spawn.h" PRIVATE HAVE_POSIX_SPAWN_CLOEXEC_DEFAULT)
 define_if_symbol_exists(libAtomVM O_CLOEXEC "fcntl.h" PRIVATE HAVE_O_CLOEXEC)
 define_if_symbol_exists(libAtomVM O_DIRECTORY "fcntl.h" PRIVATE HAVE_O_DIRECTORY)
@@ -326,6 +333,26 @@ if (ATOMVM_DEV)
     endif()
 else()
     set(ATOMVM_VERSION ${ATOMVM_BASE_VERSION})
+endif()
+
+set(AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if (AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH STREQUAL "")
+    set(AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH "unknown")
+endif()
+string(REPLACE "-" "_" AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH "${AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH}")
+
+set(AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS "${CMAKE_SYSTEM_NAME}")
+if (AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS STREQUAL "")
+    set(AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS "unknown")
+endif()
+if (NOT CMAKE_SYSTEM_VERSION STREQUAL "")
+    string(APPEND AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS "_${CMAKE_SYSTEM_VERSION}")
+endif()
+string(REPLACE "-" "_" AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS "${AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS}")
+
+if (NOT DEFINED AVM_SYSTEM_ARCHITECTURE_STRING OR AVM_SYSTEM_ARCHITECTURE_STRING STREQUAL "")
+    set(AVM_SYSTEM_ARCHITECTURE_STRING
+        "${AVM_SYSTEM_ARCHITECTURE_FALLBACK_ARCH}-unknown-${AVM_SYSTEM_ARCHITECTURE_FALLBACK_OS}")
 endif()
 
 # Add include to directory where avm_version.h is generated so targets linking

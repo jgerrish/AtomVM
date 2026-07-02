@@ -53,8 +53,13 @@
 #include <zlib.h>
 #endif
 
+// BEAM Types version from OTP source code:
+// lib/compiler/src/beam_types.hrl
+#define BEAM_TYPES_VERSION_V3 3
+#define BEAM_TYPES_VERSION_V4 4
+
 // BEAM Type constants from OTP source code:
-// /opt/src/otp/lib/compiler/src/beam_types.erl lines 1446-1461
+// lib/compiler/src/beam_types.erl
 #define BEAM_TYPE_ATOM (1 << 0)
 #define BEAM_TYPE_BITSTRING (1 << 1)
 #define BEAM_TYPE_CONS (1 << 2)
@@ -67,14 +72,18 @@
 #define BEAM_TYPE_PORT (1 << 9)
 #define BEAM_TYPE_REFERENCE (1 << 10)
 #define BEAM_TYPE_TUPLE (1 << 11)
+#define BEAM_TYPE_RECORD (1 << 12) // v4 only
 
-#define BEAM_TYPE_HAS_LOWER_BOUND (1 << 12)
-#define BEAM_TYPE_HAS_UPPER_BOUND (1 << 13)
-#define BEAM_TYPE_HAS_UNIT (1 << 14)
-
-// BEAM Types version from OTP source code:
-// /opt/src/otp/lib/compiler/src/beam_types.hrl line 22
-#define BEAM_TYPES_VERSION 3
+// v3 flag bits (OTP 27/28)
+#define BEAM_TYPE_V3_HAS_LOWER_BOUND (1 << 12)
+#define BEAM_TYPE_V3_HAS_UPPER_BOUND (1 << 13)
+#define BEAM_TYPE_V3_HAS_UNIT (1 << 14)
+#define BEAM_TYPE_V3_BITS_MASK 0xFFF
+// v4 flag bits (OTP 29+)
+#define BEAM_TYPE_V4_HAS_LOWER_BOUND (1 << 13)
+#define BEAM_TYPE_V4_HAS_UPPER_BOUND (1 << 14)
+#define BEAM_TYPE_V4_HAS_UNIT (1 << 15)
+#define BEAM_TYPE_V4_BITS_MASK 0x1FFF
 
 #define LITT_UNCOMPRESSED_SIZE_OFFSET 8
 #define LITT_HEADER_SIZE 12
@@ -986,6 +995,30 @@ void module_get_imported_function_module_and_name_atoms(
 
 bool module_get_function_from_label(Module *this_module, int label, atom_index_t *function_name, int *arity)
 {
+#if defined(JIT_JUMPTABLE_IS_DATA) && !defined(AVM_NO_JIT)
+    // WASM: resolve continuation labels to their parent BEAM label using the
+    // cont_label_map stored in the metadata block.
+    if (this_module->native_code) {
+        const uint8_t *metadata = jit_wasm_get_lines_metadata((const void *) this_module->native_code);
+        if (!IS_NULL_PTR(metadata)) {
+            // Skip past lines data to reach cont_label_map
+            uint16_t lines_count = metadata[0] | (metadata[1] << 8);
+            const uint8_t *cont_map_ptr = metadata + 2 + lines_count * 6;
+            uint16_t cont_map_count = cont_map_ptr[0] | (cont_map_ptr[1] << 8);
+            cont_map_ptr += 2;
+            for (uint16_t i = 0; i < cont_map_count; i++) {
+                uint16_t cont_label = cont_map_ptr[0] | (cont_map_ptr[1] << 8);
+                uint16_t beam_label = cont_map_ptr[2] | (cont_map_ptr[3] << 8);
+                cont_map_ptr += 4;
+                if (cont_label == label) {
+                    label = beam_label;
+                    break;
+                }
+            }
+        }
+    }
+#endif
+
     int best_label = -1;
     const uint8_t *export_table_data = (const uint8_t *) this_module->export_table;
     int exports_count = READ_32_UNALIGNED(export_table_data + 8);
@@ -1114,6 +1147,8 @@ Module *module_new_from_iff_binary(GlobalContext *global, const void *iff_binary
     mod->fun_table = beam_file + offsets[FUNT];
     mod->str_table = beam_file + offsets[STRT];
     mod->str_table_len = sizes[STRT];
+    mod->binary = beam_file;
+    mod->binary_size = size;
 #ifndef AVM_NO_JIT
     if (offsets[AVMN]) {
         NativeCodeChunk *native_code = (NativeCodeChunk *) (beam_file + offsets[AVMN]);
@@ -1122,15 +1157,25 @@ Module *module_new_from_iff_binary(GlobalContext *global, const void *iff_binary
             fprintf(stderr, "Unknown native code chunk version (%d)\n", ENDIAN_SWAP_16(native_code->version));
         } else {
             for (int arch_index = 0; arch_index < ENDIAN_SWAP_16(native_code->architectures_count); arch_index++) {
-                uint16_t runtime_variant;
+                uint16_t runtime_variant = JIT_VARIANT_PIC;
 #ifdef AVM_USE_SINGLE_PRECISION
-                runtime_variant = JIT_VARIANT_FLOAT32 | JIT_VARIANT_PIC;
-#else
-                runtime_variant = JIT_VARIANT_PIC;
+                runtime_variant |= JIT_VARIANT_FLOAT32;
+#endif
+#ifdef AVM_JIT_THUMB2
+                runtime_variant |= JIT_VARIANT_THUMB2;
 #endif
                 if (ENDIAN_SWAP_16(native_code->architectures[arch_index].architecture) == JIT_ARCH_TARGET && ENDIAN_SWAP_16(native_code->architectures[arch_index].variant) == runtime_variant) {
-                    size_t offset = ENDIAN_SWAP_32(native_code->info_size) + ENDIAN_SWAP_32(native_code->architectures[arch_index].offset) + sizeof(native_code->info_size);
-                    ModuleNativeEntryPoint module_entry_point = sys_map_native_code((const uint8_t *) &native_code->info_size, ENDIAN_SWAP_32(native_code->size), offset);
+                    size_t arch_offset = ENDIAN_SWAP_32(native_code->architectures[arch_index].offset);
+                    size_t arch_code_size;
+                    if (arch_index + 1 < ENDIAN_SWAP_16(native_code->architectures_count)) {
+                        arch_code_size = ENDIAN_SWAP_32(native_code->architectures[arch_index + 1].offset) - arch_offset;
+                    } else {
+                        size_t code_section_size = ENDIAN_SWAP_32(native_code->size) - sizeof(native_code->info_size) - ENDIAN_SWAP_32(native_code->info_size);
+                        arch_code_size = code_section_size - arch_offset;
+                    }
+                    size_t header_offset = ENDIAN_SWAP_32(native_code->info_size) + arch_offset + sizeof(native_code->info_size);
+                    const uint8_t *arch_code = (const uint8_t *) &native_code->info_size + header_offset;
+                    ModuleNativeEntryPoint module_entry_point = sys_map_native_code(arch_code, arch_code_size);
                     module_set_native_code(mod, ENDIAN_SWAP_32(native_code->labels), module_entry_point);
 
 #ifndef AVM_NO_JIT_DWARF
@@ -1277,6 +1322,11 @@ COLD_FUNC void module_destroy(Module *module)
     if (module->free_literals_data) {
         free(module->literals_data);
     }
+#ifndef AVM_NO_JIT
+    if (module->native_code) {
+        sys_release_native_code(module->native_code);
+    }
+#endif
 #ifndef AVM_NO_SMP
     smp_mutex_destroy(module->mutex);
 #endif
@@ -1370,13 +1420,29 @@ term module_get_type_by_index(const Module *mod, int type_index, Context *ctx)
     uint32_t count = READ_32_UNALIGNED(types_data + 4);
 
     // Check if version is supported
-    if (version != BEAM_TYPES_VERSION) {
+    if (version != BEAM_TYPES_VERSION_V3 && version != BEAM_TYPES_VERSION_V4) {
         return globalcontext_make_atom(ctx->global, ATOM_STR("\x3", "any"));
     }
 
     // Check bounds
     if (type_index >= (int) count) {
         return globalcontext_make_atom(ctx->global, ATOM_STR("\x3", "any"));
+    }
+
+    uint16_t has_lower_bound_mask;
+    uint16_t has_upper_bound_mask;
+    uint16_t has_unit_mask;
+    uint16_t type_bits_mask;
+    if (version == BEAM_TYPES_VERSION_V4) {
+        has_lower_bound_mask = BEAM_TYPE_V4_HAS_LOWER_BOUND;
+        has_upper_bound_mask = BEAM_TYPE_V4_HAS_UPPER_BOUND;
+        has_unit_mask = BEAM_TYPE_V4_HAS_UNIT;
+        type_bits_mask = BEAM_TYPE_V4_BITS_MASK;
+    } else {
+        has_lower_bound_mask = BEAM_TYPE_V3_HAS_LOWER_BOUND;
+        has_upper_bound_mask = BEAM_TYPE_V3_HAS_UPPER_BOUND;
+        has_unit_mask = BEAM_TYPE_V3_HAS_UNIT;
+        type_bits_mask = BEAM_TYPE_V3_BITS_MASK;
     }
 
     // Skip to type data
@@ -1389,13 +1455,13 @@ term module_get_type_by_index(const Module *mod, int type_index, Context *ctx)
         pos += 2;
 
         // Skip extra data if present
-        if (type_bits & BEAM_TYPE_HAS_LOWER_BOUND) {
+        if (type_bits & has_lower_bound_mask) {
             pos += 8;
         }
-        if (type_bits & BEAM_TYPE_HAS_UPPER_BOUND) {
+        if (type_bits & has_upper_bound_mask) {
             pos += 8;
         }
-        if (type_bits & BEAM_TYPE_HAS_UNIT) {
+        if (type_bits & has_unit_mask) {
             pos += 1;
         }
     }
@@ -1411,24 +1477,24 @@ term module_get_type_by_index(const Module *mod, int type_index, Context *ctx)
     bool has_lower = false;
     bool has_upper = false;
 
-    if (type_bits & BEAM_TYPE_HAS_LOWER_BOUND) {
+    if (type_bits & has_lower_bound_mask) {
         lower_bound = (int64_t) READ_64_UNALIGNED(pos);
         pos += 8;
         has_lower = true;
     }
-    if (type_bits & BEAM_TYPE_HAS_UPPER_BOUND) {
+    if (type_bits & has_upper_bound_mask) {
         upper_bound = (int64_t) READ_64_UNALIGNED(pos);
         pos += 8;
         has_upper = true;
     }
-    if (type_bits & BEAM_TYPE_HAS_UNIT) {
+    if (type_bits & has_unit_mask) {
         unit = *pos + 1; // Stored as unit-1
         pos += 1;
     }
 
     // Decode type based on TypeBits (matching jit_precompile.erl exact pattern matching)
-    // From OTP source code: /opt/src/otp/lib/compiler/src/beam_types.erl decode_type function
-    uint16_t type_pattern = type_bits & 0xFFF; // Mask out flags, keep type bits
+    // From OTP source code: lib/compiler/src/beam_types.erl decode_type function
+    uint16_t type_pattern = type_bits & type_bits_mask;
 
     switch (type_pattern) {
         case BEAM_TYPE_ATOM:
@@ -1540,6 +1606,9 @@ term module_get_type_by_index(const Module *mod, int type_index, Context *ctx)
         case BEAM_TYPE_TUPLE:
             return globalcontext_make_atom(ctx->global, ATOM_STR("\x7", "t_tuple"));
 
+        case BEAM_TYPE_RECORD:
+            return globalcontext_make_atom(ctx->global, ATOM_STR("\x8", "t_record"));
+
         default:
             // Default fallback for any other combination or union types
             return globalcontext_make_atom(ctx->global, ATOM_STR("\x3", "any"));
@@ -1549,8 +1618,20 @@ term module_get_type_by_index(const Module *mod, int type_index, Context *ctx)
 #ifndef AVM_NO_JIT
 ModuleNativeEntryPoint module_get_native_entry_point(Module *module, int exported_label)
 {
+#ifdef JIT_JUMPTABLE_IS_DATA
+    // WASM: entry_point is not used by the dispatch loop (it uses
+    // JIT_CONTINUATION_FOR_LABEL which stores label+1 and resolves
+    // per-thread function pointers lazily). Return NULL if the module
+    // hasn't been JIT-compiled yet — the caller will store this but
+    // never dereference it.
+    if (!module->native_code) {
+        return NULL;
+    }
+    return jit_wasm_get_entry_point((const void *) module->native_code, exported_label);
+#else
     assert(module->native_code);
-    return (ModuleNativeEntryPoint) (((const uint8_t *) module->native_code) + JIT_JUMPTABLE_ENTRY_SIZE * exported_label);
+    return (ModuleNativeEntryPoint) (((const uint8_t *) module->native_code) + JIT_JUMPTABLE_OFFSET + JIT_JUMPTABLE_ENTRY_SIZE * exported_label);
+#endif
 }
 #endif
 
@@ -1565,7 +1646,15 @@ static const struct ExportedFunction *module_create_function(Module *found_modul
         }
         mfunc->base.type = ModuleNativeFunction;
         mfunc->target = found_module;
+#ifdef JIT_JUMPTABLE_IS_DATA
+        // WASM: the dispatch loop uses label (via JIT_CONTINUATION_FOR_LABEL)
+        // to resolve per-thread function pointers lazily.
+        // label and entry_point share a union, so don't write entry_point.
+        mfunc->label = exported_label;
+#else
+        // entry_point overwrites label in the union
         mfunc->entry_point = module_get_native_entry_point(found_module, exported_label);
+#endif
 
         return &mfunc->base;
     } else {
@@ -1911,12 +2000,49 @@ static bool module_find_line_ref(Module *mod, uint16_t line_ref, uint32_t *line,
     return module_get_location(mod, location_ix, filename_len, filename);
 }
 
-bool module_find_line(Module *mod, unsigned int offset, uint32_t *line, size_t *filename_len, const uint8_t **filename)
+bool module_find_line(Module *mod, size_t offset, uint32_t *line, size_t *filename_len, const uint8_t **filename)
 {
     size_t i;
 #ifndef AVM_NO_JIT
     if (mod->native_code) {
+#ifdef JIT_JUMPTABLE_IS_DATA
+        // WASM: lines data is stored in the JITWasmHeader metadata.
+        // Both line offsets and query offsets use label * JTE_SIZE format.
+        {
+            const uint8_t *lines_data = jit_wasm_get_lines_metadata((const void *) mod->native_code);
+            if (IS_NULL_PTR(lines_data)) {
+                return false;
+            }
+            size_t lines_count = lines_data[0] | (lines_data[1] << 8);
+            if (lines_count == 0) {
+                return false;
+            }
+            const uint8_t *entry = lines_data + 2;
+            uint16_t prev_line_ref = 0;
+            for (i = 0; i < lines_count; i++) {
+                uint16_t line_ref = entry[0] | (entry[1] << 8);
+                uint32_t ref_offset = entry[2] | (entry[3] << 8) | (entry[4] << 16) | (entry[5] << 24);
+                entry += 6;
+                if (offset == ref_offset) {
+                    return module_find_line_ref(mod, line_ref, line, filename_len, filename);
+                } else if (i == 0 && offset < ref_offset) {
+                    return false;
+                } else if (offset < ref_offset) {
+                    return module_find_line_ref(mod, prev_line_ref, line, filename_len, filename);
+                }
+                prev_line_ref = line_ref;
+            }
+            return module_find_line_ref(mod, prev_line_ref, line, filename_len, filename);
+        }
+
+#else
+#if JIT_ARCH_TARGET == JIT_ARCH_XTENSA
+        struct JITState temp_jit_state = { .code_base = (const void *) mod->native_code };
+        ModuleNativeEntryPoint label0_entry = module_get_native_entry_point(mod, 0);
+        const uint8_t *labels_and_lines = (const uint8_t *) label0_entry(NULL, &temp_jit_state, NULL);
+#else
         const uint8_t *labels_and_lines = (const uint8_t *) mod->native_code(NULL, NULL, NULL);
+#endif
         int labels_count = READ_16_UNALIGNED(labels_and_lines);
         labels_and_lines += 2 + labels_count * 6;
         size_t lines_count = READ_16_UNALIGNED(labels_and_lines);
@@ -1940,6 +2066,7 @@ bool module_find_line(Module *mod, unsigned int offset, uint32_t *line, size_t *
             prev_line_ref = line_ref;
         }
         return module_find_line_ref(mod, prev_line_ref, line, filename_len, filename);
+#endif /* !JIT_JUMPTABLE_IS_DATA */
     } else {
 #if defined(AVM_NO_EMU)
         return false;
@@ -1977,10 +2104,10 @@ bool module_find_line(Module *mod, unsigned int offset, uint32_t *line, size_t *
 #endif
 }
 
-COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, int *l_off, long *out_mod_offset, GlobalContext *global)
+COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, size_t *l_off, size_t *out_mod_offset, GlobalContext *global)
 {
     Module *mod = globalcontext_get_module_by_index(global, ((uintptr_t) cp) >> 24);
-    long mod_offset = (cp & 0xFFFFFF) >> 2;
+    size_t mod_offset = (cp & 0xFFFFFF) >> 2;
     if (out_mod_offset) {
         *out_mod_offset = mod_offset;
     }
@@ -1991,7 +2118,24 @@ COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, i
 
 #ifndef AVM_NO_JIT
     if (mod->native_code) {
+#ifdef JIT_JUMPTABLE_IS_DATA
+        // WASM: label is directly encoded in the CP offset
+        // mod_offset = label * JIT_JUMPTABLE_ENTRY_SIZE
+        if (label) {
+            *label = (int) (mod_offset / JIT_JUMPTABLE_ENTRY_SIZE);
+        }
+        if (l_off) {
+            *l_off = 0;
+        }
+#else
+#if JIT_ARCH_TARGET == JIT_ARCH_XTENSA
+        // C11 6.7.9 §21 : this is safe
+        struct JITState temp_jit_state = { .code_base = (const void *) mod->native_code };
+        ModuleNativeEntryPoint label0_entry = module_get_native_entry_point(mod, 0);
+        const uint8_t *labels_and_lines = (const uint8_t *) label0_entry(NULL, &temp_jit_state, NULL);
+#else
         const uint8_t *labels_and_lines = (const uint8_t *) mod->native_code(NULL, NULL, NULL);
+#endif
         int labels_count = READ_16_UNALIGNED(labels_and_lines);
         labels_and_lines += 2;
         uint32_t label_offset = 0;
@@ -2015,7 +2159,7 @@ COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, i
                     *label = new_label_id;
                 }
                 if (l_off) {
-                    *l_off = mod_offset - new_label_offset;
+                    *l_off = 0;
                 }
                 return;
             }
@@ -2030,6 +2174,7 @@ COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, i
             *l_off = 0;
         }
 #endif
+#endif
 #if !defined(AVM_NO_JIT) && !defined(AVM_NO_EMU)
     } else {
 #endif
@@ -2039,7 +2184,7 @@ COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, i
 
         int i = 1;
         const uint8_t *l = mod->labels[1];
-        while (mod_offset > l - code) {
+        while (mod_offset > (size_t) (l - code)) {
             i++;
             if (i >= labels_count) {
                 // last label + 1 is reserved for end of module.
@@ -2058,7 +2203,7 @@ COLD_FUNC void module_cp_to_label_offset(term cp, Module **cp_mod, int *label, i
             *label = i - 1;
         }
         if (l_off) {
-            *l_off = mod_offset - (mod->labels[*label] - code);
+            *l_off = mod_offset - (mod->labels[i - 1] - code);
         }
 #endif
 #ifndef AVM_NO_JIT
@@ -2070,7 +2215,16 @@ uint32_t module_label_code_offset(Module *mod, int label)
 {
 #ifndef AVM_NO_JIT
     if (mod->native_code) {
+#ifdef JIT_JUMPTABLE_IS_DATA
+        return (uint32_t) label * JIT_JUMPTABLE_ENTRY_SIZE;
+#else
+#if JIT_ARCH_TARGET == JIT_ARCH_XTENSA
+        struct JITState temp_jit_state = { .code_base = (const void *) mod->native_code };
+        ModuleNativeEntryPoint label0_entry = module_get_native_entry_point(mod, 0);
+        const uint8_t *labels_and_lines = (const uint8_t *) label0_entry(NULL, &temp_jit_state, NULL);
+#else
         const uint8_t *labels_and_lines = (const uint8_t *) mod->native_code(NULL, NULL, NULL);
+#endif
         int labels_count = READ_16_UNALIGNED(labels_and_lines);
         labels_and_lines += 2;
         while (labels_count > 0) {
@@ -2084,6 +2238,7 @@ uint32_t module_label_code_offset(Module *mod, int label)
             labels_count--;
         }
         return 0;
+#endif
     } else {
 #endif
         uint8_t *code = &mod->code->code[0];
@@ -2098,6 +2253,6 @@ void module_set_native_code(Module *mod, uint32_t labels_count, ModuleNativeEntr
 {
     mod->native_code = entry_point;
     // Extra function is OP_INT_CALL_END
-    mod->end_instruction_ii = JIT_JUMPTABLE_ENTRY_SIZE * labels_count;
+    mod->end_instruction_ii = JIT_JUMPTABLE_OFFSET + JIT_JUMPTABLE_ENTRY_SIZE * labels_count;
 }
 #endif

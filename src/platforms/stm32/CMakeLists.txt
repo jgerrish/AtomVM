@@ -84,9 +84,6 @@ endif ()
 mark_as_advanced(CMAKE_TOOLCHAIN_FILE)
 
 option(AVM_DISABLE_JIT "Disable just in time compilation." ON)
-if (NOT AVM_DISABLE_JIT)
-    set(AVM_JIT_TARGET_ARCH "armv6m")
-endif()
 
 if ((NOT ${CMAKE_C_COMPILER_ID} STREQUAL "GNU") OR
     (NOT ${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU") OR
@@ -131,11 +128,31 @@ set(HAVE_RMDIR "" CACHE INTERNAL "Have symbol rmdir" FORCE)
 # Include device detection (sets STM32_FAMILY, CPU flags, HAL defines, etc.)
 include(cmake/stm32_device.cmake)
 
+# Set JIT target architecture based on detected CPU (needs STM32_CPU from stm32_device.cmake)
+if (NOT AVM_DISABLE_JIT)
+    # Cortex-M0/M0+ are ARMv6-M (Thumb-1 only), all others support Thumb-2
+    if (STM32_CPU MATCHES "cortex-m0")
+        set(AVM_JIT_TARGET_ARCH "armv6m")
+    else()
+        set(AVM_JIT_TARGET_ARCH "armv6m+thumb2")
+    endif()
+endif()
+
 # Include auto-device configuration (escript query for clock, ROM, etc.)
 include(cmake/atomvm_dev_config.cmake)
 
 # Include SDK fetch (CMSIS + HAL/LL)
 include(cmake/stm32_sdk.cmake)
+
+option(AVM_USB_CDC_PORT_DRIVER_ENABLED "Enable USB CDC port driver" OFF)
+set(AVM_USB_CDC_VID "0xCAFE" CACHE STRING "USB CDC vendor ID (default: TinyUSB example placeholder; override for distribution)")
+set(AVM_USB_CDC_PID "0x4001" CACHE STRING "USB CDC product ID (default: TinyUSB example placeholder; override for distribution)")
+set(AVM_USB_CDC_MANUFACTURER "AtomVM" CACHE STRING "USB CDC iManufacturer string descriptor")
+set(AVM_USB_CDC_PRODUCT "AtomVM CDC" CACHE STRING "USB CDC iProduct string descriptor")
+set(AVM_USB_CDC_INTERFACE_NAME "AtomVM CDC ACM" CACHE STRING "USB CDC interface string descriptor")
+if (AVM_USB_CDC_PORT_DRIVER_ENABLED)
+    include(cmake/stm32_tinyusb.cmake)
+endif()
 
 # Include additional compilation flags (must come after dev_config sets CMAKE_FLASH_SIZE)
 include(cmake/compile-flags.cmake)
@@ -164,6 +181,13 @@ configure_file(${LINKER_SCRIPT_IN} ${LINKER_SCRIPT} @ONLY)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stm32_hal_conf.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/generated/${STM32_FAMILY}_hal_conf.h
+    @ONLY
+)
+
+# Generate device atom literals header from template
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stm32_device_atoms.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/stm32_device_atoms.h
     @ONLY
 )
 

@@ -14,10 +14,20 @@ Distribution is currently available on all platforms with TCP/IP communication, 
 - ESP32
 - RP2 (Pico)
 
-Two examples are provided:
+Distribution over serial (UART) is also available for point-to-point
+connections between any two nodes, including microcontrollers without
+networking (e.g. STM32). See [Serial distribution](#serial-distribution).
+
+Distribution over USB CDC is also supported on ESP32-S2/S3, RP2040/RP2350,
+and STM32, using the same `serial_dist` protocol. On Unix hosts, USB CDC
+devices appear as standard serial ports. See [USB distribution](#usb-distribution).
+
+Four examples are provided:
 
 - disterl in `examples/erlang/disterl.erl`: distribution on Unix systems
 - epmd\_disterl in `examples/erlang/esp32/epmd_disterl.erl`: distribution on ESP32 devices
+- serial\_disterl in `examples/erlang/serial_disterl.erl`: distribution over serial (ESP32 and Unix)
+- usb\_disterl in `examples/erlang/usb_disterl.erl`: distribution over USB CDC (all platforms)
 
 ## Starting and stopping distribution
 
@@ -93,6 +103,214 @@ fun (DistCtrlr, Length :: pos_integer(), Timeout :: timeout()) -> {ok, Packet} |
 ```
 
 AtomVM's distribution is based on `socket_dist` and `socket_dist_controller` modules which can also be used with BEAM by definining `BEAM_INTERFACE` to adjust for the difference.
+
+## Serial distribution
+
+AtomVM supports distribution over serial (UART) connections using the
+`serial_dist` module. This is useful for microcontrollers that lack
+WiFi/TCP (e.g. STM32) but have UART, and for testing distribution
+locally using virtual serial ports.
+
+### Quick start
+
+```erlang
+{ok, _} = net_kernel:start('mynode@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_opts => [{peripheral, "UART1"}, {speed, 115200},
+                      {tx, 17}, {rx, 16}],
+        uart_module => uart
+    }
+}).
+```
+
+On Unix, the `peripheral` is a device path such as `"/dev/ttyUSB0"` and
+the `uart_module` is `uart` from the `avm_unix` library.
+
+### serial\_dist options
+
+- `uart_opts` — proplist passed to `UartModule:open/1` for a single port
+  (see `uart_hal` for common parameters: `peripheral`, `speed`,
+  `data_bits`, `stop_bits`, `parity`, `flow_control`)
+- `uart_ports` — list of proplists, one per UART port. Use instead of
+  `uart_opts` when connecting to multiple peers.
+- `uart_module` — module implementing the `uart_hal` behaviour. Defaults
+  to `uart`.
+
+### Wire protocol
+
+All packets on the wire use the same frame format:
+
+```
+<<16#AA, 16#55, Length:LenBits/big, Payload:Length/binary, CRC32:32/big>>
+```
+
+where `LenBits` is 16 during the handshake phase and 32 during the data
+phase. The CRC32 covers the `Length` and `Payload` bytes (everything
+between the sync marker and the CRC itself).
+
+The receiver scans for the `<<16#AA, 16#55>>` sync marker, reads the
+length field, validates it against a maximum frame size (to reject false
+sync matches where the marker appears in stale data), then verifies the
+CRC32. On CRC failure the connection is torn down.
+
+**Sync markers**
+
+Both sides periodically send bare 2-byte sync markers
+(`<<16#AA, 16#55>>`) on the UART outside of any frame. These serve two
+purposes:
+
+- **Liveness detection**: a node knows its peer is alive when it
+  receives sync markers.
+- **Stale data recovery**: after a failed handshake attempt, leftover
+  bytes remain in the UART buffer. The frame scanner skips over any
+  data (including stale sync markers) that does not form a valid frame
+  with a correct length and CRC.
+
+**Handshake phase (16-bit length)**
+
+During the Erlang distribution handshake, the `Length` field is 16 bits.
+The handshake follows the standard Erlang distribution protocol
+(send\_name, send\_status, send\_challenge, send\_challenge\_reply,
+send\_challenge\_ack).
+
+**Data phase (32-bit length)**
+
+After the handshake completes, the `Length` field switches to 32 bits.
+Tick (keepalive) messages are sent as a frame with a zero-length payload
+(i.e. `Length = 0`).
+
+### Peer-to-peer connection model
+
+Unlike TCP distribution which uses a client/server model (one side
+listens, the other connects), serial is point-to-point: both nodes
+share a single UART link.
+
+A **link manager** process on each node is the sole owner of UART
+reads. On each iteration it:
+
+1. Checks its mailbox for a `setup` request from `net_kernel`
+   (non-blocking). If found, enters the **setup** path (initiator)
+   immediately without proceeding to subsequent steps.
+2. Sends a sync marker.
+3. Reads from the UART with a short timeout.
+4. Passes the buffer to `scan_frame` which searches for a valid framed
+   handshake packet.
+5. If a complete or partial frame is detected, enters the **accept**
+   path (responder).
+6. Otherwise, loops.
+
+This design ensures only one process reads from the UART at any time,
+avoiding the race condition that would occur if separate accept and
+setup processes competed for the same byte stream.
+
+If a handshake fails (the distribution controller process exits), the
+link manager flushes stale `setup` messages from its mailbox and
+restarts the loop, allowing retries.
+
+### Testing with socat
+
+On Unix, `socat` can create virtual serial port pairs for testing:
+
+```bash
+socat -d -d pty,raw,echo=0 pty,raw,echo=0
+```
+
+This creates two pseudo-terminal devices (e.g. `/dev/ttys003` and
+`/dev/ttys004`) connected back-to-back. Each AtomVM node uses one side:
+
+```erlang
+%% Node A
+{ok, _} = net_kernel:start('a@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_opts => [{peripheral, "/dev/ttys003"}, {speed, 115200}],
+        uart_module => uart
+    }
+}).
+
+%% Node B (separate AtomVM process)
+{ok, _} = net_kernel:start('b@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_opts => [{peripheral, "/dev/ttys004"}, {speed, 115200}],
+        uart_module => uart
+    }
+}).
+
+%% From Node B, trigger autoconnect:
+{some_registered_name, 'a@serial.local'} ! {self(), hello}.
+```
+
+## USB distribution
+
+AtomVM supports distribution over USB CDC (Communications Device Class)
+connections. USB CDC makes the device appear as a virtual serial port,
+so it reuses the `serial_dist` module with a USB-specific HAL module.
+
+See the [USB CDC](./programmers-guide.md#usb-cdc) section of the Programmer's
+Guide for how to enable the port driver on each platform
+
+### Platform support
+
+| Platform | Module | Notes |
+|----------|--------|-------|
+| ESP32 (S2/S3) | `usb_cdc` | Requires TinyUSB CDC (`CONFIG_AVM_ENABLE_USB_CDC_PORT_DRIVER`) |
+| RP2040/RP2350 | `usb_cdc` | Requires `AVM_USB_CDC_PORT_DRIVER_ENABLED`; disable `pico_enable_stdio_usb` |
+| STM32 | `usb_cdc` | Requires TinyUSB integration and `AVM_USB_CDC_PORT_DRIVER_ENABLED` |
+| Unix | `uart` | USB CDC devices appear as `/dev/ttyACMx` (Linux) or `/dev/cu.usbmodemXXXX` (macOS) |
+
+### Quick start, MCU side (ESP32-S3 example)
+
+```erlang
+{ok, _} = net_kernel:start('sensor@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_opts => [{peripheral, "CDC0"}],
+        uart_module => usb_cdc
+    }
+}).
+```
+
+### Quick start, Unix host side
+
+On Unix, USB CDC devices are standard serial ports. Use the regular
+`uart` module:
+
+```erlang
+{ok, _} = net_kernel:start('host@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_opts => [{peripheral, "/dev/ttyACM0"}, {speed, 115200}],
+        uart_module => uart
+    }
+}).
+```
+
+### Multi-device topology
+
+USB uses a star topology: one host connects to multiple devices through
+a USB hub. Each device appears as a separate `/dev/ttyACMx` on the host.
+Use `uart_ports` (list of proplists) to connect to multiple devices:
+
+```erlang
+{ok, _} = net_kernel:start('host@serial.local', #{
+    name_domain => longnames,
+    proto_dist => serial_dist,
+    avm_dist_opts => #{
+        uart_ports => [
+            [{peripheral, "/dev/ttyACM0"}, {speed, 115200}],
+            [{peripheral, "/dev/ttyACM1"}, {speed, 115200}]
+        ],
+        uart_module => uart
+    }
+}).
+```
 
 ## Distribution features
 

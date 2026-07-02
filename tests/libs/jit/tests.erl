@@ -25,17 +25,28 @@
 % Module is used when running tests with BEAM.
 % When running tests with AtomVM, eunit:start/0 is used instead.
 start() ->
-    etest:test([
+    "BEAM" = erlang:system_info(machine),
+    Result = etest:test([
         jit_tests,
         jit_dwarf_tests,
         jit_aarch64_tests,
         jit_aarch64_asm_tests,
+        jit_arm32_tests,
+        jit_arm32_asm_tests,
         jit_armv6m_tests,
         jit_armv6m_asm_tests,
+        jit_armv7m_tests,
+        jit_armv7m_asm_tests,
         jit_riscv32_tests,
         jit_riscv32_asm_tests,
         jit_riscv64_tests,
         jit_riscv64_asm_tests,
         jit_x86_64_tests,
-        jit_x86_64_asm_tests
-    ]).
+        jit_x86_64_asm_tests,
+        jit_xtensa_tests,
+        jit_xtensa_asm_tests
+    ]),
+    case Result of
+        ok -> ok;
+        _ -> erlang:halt(1)
+    end.

@@ -25,8 +25,16 @@ set_target_properties(AtomVM PROPERTIES RUNTIME_OUTPUT_DIRECTORY ../../ ENABLE_E
 target_compile_features(AtomVM PUBLIC c_std_11)
 if(CMAKE_COMPILER_IS_GNUCC)
     target_compile_options(AtomVM PUBLIC -Wall -pedantic -Wextra -ggdb)
+    # Add text-section-literals for Xtensa to fix literal pool out of range issues
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU" AND CMAKE_C_COMPILER_TARGET MATCHES "xtensa")
+        target_compile_options(AtomVM PUBLIC -mtext-section-literals)
+    endif()
 elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_options(AtomVM PUBLIC -Wall -pedantic -Wextra -g)
+    # Add text-section-literals for Xtensa to fix literal pool out of range issues
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_C_COMPILER_TARGET MATCHES "xtensa")
+        target_compile_options(AtomVM PUBLIC -mtext-section-literals)
+    endif()
 endif()
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
@@ -45,6 +53,11 @@ endif()
 add_subdirectory(lib)
 target_include_directories(AtomVM PUBLIC lib/)
 
+include(SystemArchitecture)
+if (NOT DEFINED AVM_SYSTEM_ARCHITECTURE_STRING OR "${AVM_SYSTEM_ARCHITECTURE_STRING}" STREQUAL "")
+    avm_get_system_architecture_string(AVM_SYSTEM_ARCHITECTURE_STRING)
+endif()
+
 add_subdirectory(../../libAtomVM libAtomVM)
 target_link_libraries(AtomVM PRIVATE libAtomVM)
 
@@ -54,7 +67,7 @@ set(
 )
 target_link_libraries(AtomVM PRIVATE libAtomVM${PLATFORM_LIB_SUFFIX})
 
-if(AVM_DISABLE_JIT)
+if(AVM_DISABLE_JIT AND NOT AVM_ENABLE_PRECOMPILED)
 set(precompiled_suffix)
 else()
 set(precompiled_suffix "-${AVM_JIT_TARGET_ARCH}")

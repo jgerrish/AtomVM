@@ -60,7 +60,7 @@ jobs:
           cmake_opts_other: "-DAVM_DISABLE_JIT=OFF"
 
         # JIT + DWARF build (macOS aarch64)
-        - os: "macos-15"
+        - os: "macos-26"
           otp: "28"
           mbedtls: "mbedtls@3"
           cmake_opts_other: "-DAVM_DISABLE_JIT=OFF -DAVM_DISABLE_JIT_DWARF=OFF"
@@ -68,31 +68,22 @@ jobs:
     steps:
     # Setup
     - name: "Checkout repo"
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: 'recursive'
-
-    - name: "Normalize ImageOS for setup-beam"
-      if: matrix.os == 'macos-26'
-      run: echo "ImageOS=macos15" >> "$GITHUB_ENV"
 
     - uses: erlef/setup-beam@v1
       with:
         otp-version: ${{ matrix.otp }}
         rebar3-version: ${{ fromJSON('{"26":"3.25.1","27":"3.25.1","28":"3.26"}')[matrix.otp] || '3' }}
+        gleam-version: "1.15.2"
         hexpm-mirrors: |
           https://builds.hex.pm
           https://repo.hex.pm
           https://cdn.jsdelivr.net/hex
 
     - name: "Install deps"
-      run: brew update && HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install gperf doxygen socat ${{ matrix.mbedtls }}
-
-    - name: "Install Gleam"
-      run: |
-        # Reuse the OTP/rebar3 installed by setup-beam instead of Homebrew dependencies.
-        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install --ignore-dependencies gleam
-        gleam --version
+      run: brew update && HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install coreutils gperf doxygen socat ${{ matrix.mbedtls }}
 
     - name: "Workaround for nxdomain random issues"
       run: |
@@ -154,6 +145,94 @@ jobs:
       run: |
         ./tests/test-erlang
 
+    - name: "Test: dwarf (test_executable_line)"
+      if: matrix.cmake_opts_other == '-DAVM_DISABLE_JIT=OFF -DAVM_DISABLE_JIT_DWARF=OFF'
+      timeout-minutes: 4
+      working-directory: build
+      env:
+        # Apple lldb < 2100 hangs forever resolving pending source-line
+        # breakpoints against JIT-emitted DWARF on macOS 26 (the active
+        # Xcode 26.2 lldb is 1703.x). The CommandLineTools lldb is at
+        # 2100 and works.
+        LLDB: /Library/Developer/CommandLineTools/usr/bin/lldb
+      run: |
+        [ -x "$LLDB" ] || { echo "FAIL: $LLDB not executable"; exit 1; }
+        echo "## using $LLDB"
+        "$LLDB" --version | head -2
+        LOG=/tmp/lldb-test_executable_line.log
+        set +e
+        gtimeout --foreground -k 30 120 "$LLDB" -b \
+          -o "log enable -f /tmp/lldb-jit-loader.log lldb jit" \
+          -o "log enable -f /tmp/lldb-gdb-test.log gdb-remote packets" \
+          -o "settings set plugin.jit-loader.gdb.enable on" \
+          -o "breakpoint set -f test_executable_line.erl -l 49" \
+          -o "breakpoint set -f test_executable_line.erl -l 52" \
+          -o "run" \
+          -o "print term_to_int(ctx->x[0])" \
+          -o "c" \
+          -o "print term_to_int(ctx->x[0])" \
+          -o "quit" \
+          -- ./tests/test-erlang test_executable_line 2>&1 | tee "$LOG"
+        LLDB_RC=${PIPESTATUS[0]}
+        set -e
+        if [ "$LLDB_RC" -eq 124 ] || [ "$LLDB_RC" -eq 137 ]; then
+          echo "FAIL: lldb timed out (rc=$LLDB_RC)"
+          [ -f /tmp/lldb-jit-loader.log ] && { echo "## jit log"; head -200 /tmp/lldb-jit-loader.log; }
+          [ -f /tmp/lldb-gdb-test.log ] && { echo "## gdb-remote packets (tail)"; tail -120 /tmp/lldb-gdb-test.log; }
+          exit 1
+        fi
+        VALUES=$(sed -n 's/^(\(avm_int_t\)) \(-\{0,1\}[0-9][0-9]*\).*/\2/p' "$LOG")
+        FIRST=$(echo "$VALUES" | sed -n '1p')
+        SECOND=$(echo "$VALUES" | sed -n '2p')
+        if [ "$FIRST" != "42" ]; then
+          echo "FAIL: expected 42 at line 49, got '$FIRST'"
+          exit 1
+        fi
+        if [ "$SECOND" != "2" ]; then
+          echo "FAIL: expected 2 at line 52, got '$SECOND'"
+          exit 1
+        fi
+        echo "PASS: test_executable_line dwarf test"
+
+    - name: "Test: dwarf (test_debug_line)"
+      if: matrix.cmake_opts_other == '-DAVM_DISABLE_JIT=OFF -DAVM_DISABLE_JIT_DWARF=OFF'
+      timeout-minutes: 6
+      working-directory: build
+      env:
+        LLDB: /Library/Developer/CommandLineTools/usr/bin/lldb
+      run: |
+        [ -x "$LLDB" ] || { echo "FAIL: $LLDB not executable"; exit 1; }
+        LOG=/tmp/lldb-test_debug_line.log
+        set +e
+        gtimeout --foreground -k 30 240 "$LLDB" -b \
+          -o "settings set plugin.jit-loader.gdb.enable on" \
+          -o "breakpoint set -f test_debug_line.erl -l 49" \
+          -o "breakpoint set -f test_debug_line.erl -l 52" \
+          -o "run" \
+          -o "print term_to_int(N)" \
+          -o "c" \
+          -o "print term_to_int(Z)" \
+          -o "quit" \
+          -- ./tests/test-erlang test_debug_line 2>&1 | tee "$LOG"
+        LLDB_RC=${PIPESTATUS[0]}
+        set -e
+        if [ "$LLDB_RC" -eq 124 ] || [ "$LLDB_RC" -eq 137 ]; then
+          echo "FAIL: lldb timed out (rc=$LLDB_RC)"
+          exit 1
+        fi
+        VALUES=$(sed -n 's/^(\(avm_int_t\)) \(-\{0,1\}[0-9][0-9]*\).*/\2/p' "$LOG")
+        FIRST=$(echo "$VALUES" | sed -n '1p')
+        SECOND=$(echo "$VALUES" | sed -n '2p')
+        if [ "$FIRST" != "42" ]; then
+          echo "FAIL: expected 42 at line 49, got '$FIRST'"
+          exit 1
+        fi
+        if [ "$SECOND" != "2" ]; then
+          echo "FAIL: expected 2 at line 52, got '$SECOND'"
+          exit 1
+        fi
+        echo "PASS: test_debug_line dwarf test"
+
     - name: "Test: test-enif"
       working-directory: build
       run: |
@@ -182,7 +261,7 @@ jobs:
         ./src/AtomVM ./tests/libs/etest/test_etest.avm
 
     - name: "Test: test_estdlib.avm"
-      timeout-minutes: 10
+      timeout-minutes: 20
       working-directory: build
       run: |
         ./src/AtomVM ./tests/libs/estdlib/test_estdlib.avm
@@ -194,7 +273,7 @@ jobs:
         ./src/AtomVM ./tests/libs/eavmlib/test_eavmlib.avm
 
     - name: "Test: test_jit.avm"
-      timeout-minutes: 10
+      timeout-minutes: 20
       working-directory: build
       run: |
         ./src/AtomVM tests/libs/jit/test_jit.avm

@@ -51,8 +51,7 @@
 %%          This function will open a connection to the UART driver.
 %% @end
 %%-----------------------------------------------------------------------------
--spec open(Name :: peripheral(), Opts :: uart_opts()) ->
-    Port :: port() | {error, _Reason :: term()}.
+-spec open(Name :: peripheral(), Opts :: uart_opts()) -> Port :: port().
 open(Name, Opts) ->
     open([{peripheral, Name} | Opts]).
 
@@ -64,7 +63,7 @@ open(Name, Opts) ->
 %%          This function will open a connection to the UART driver.
 %% @end
 %%-----------------------------------------------------------------------------
--spec open(Opts :: uart_opts()) -> Port :: port() | {error, _Reason :: term()}.
+-spec open(Opts :: uart_opts()) -> Port :: port().
 open(Opts) ->
     open_port({spawn, "uart"}, migrate_config(Opts)).
 
@@ -213,13 +212,17 @@ validate_peripheral([$U, $A, $R, $T | N] = Value) ->
     try list_to_integer(N) of
         _ -> Value
     catch
-        error:_ -> {bardarg, {peripheral, Value}}
+        error:_ -> error(badarg, [{peripheral, Value}])
     end;
 validate_peripheral(<<"UART", N/binary>> = Value) ->
     try binary_to_integer(N) of
         _ -> Value
     catch
-        error:_ -> {bardarg, {peripheral, Value}}
+        error:_ -> error(badarg, [{peripheral, Value}])
     end;
+validate_peripheral("USB_SERIAL_JTAG" = Value) ->
+    Value;
+validate_peripheral(<<"USB_SERIAL_JTAG">> = Value) ->
+    Value;
 validate_peripheral(Value) ->
-    throw({bardarg, {peripheral, Value}}).
+    error(badarg, [{peripheral, Value}]).

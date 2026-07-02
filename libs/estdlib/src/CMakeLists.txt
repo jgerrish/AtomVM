@@ -34,6 +34,7 @@ set(ERLANG_MODULES
     erl_epmd
     erpc
     erts_debug
+    erts_internal
     ets
     file
     filename
@@ -55,10 +56,12 @@ set(ERLANG_MODULES
     init
     io_lib
     io
+    json
     lists
     maps
     math
     net
+    os
     proc_lib
     sys
     logger
@@ -67,6 +70,8 @@ set(ERLANG_MODULES
     queue
     sets
     socket
+    serial_dist
+    serial_dist_controller
     socket_dist
     socket_dist_controller
     ssl

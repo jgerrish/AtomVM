@@ -18,11 +18,17 @@ Modules can also be ahead-of-time compiled: the native code is generated at buil
 
 The JIT compiler supports the following target architectures:
 
-* `x86_64` — 64-bit x86 (Linux, macOS, FreeBSD)
-* `aarch64` — 64-bit ARM (Linux, macOS)
-* `armv6m` — ARM Cortex-M0+ (Raspberry Pi Pico, STM32)
-* `riscv32` — 32-bit RISC-V
-* `riscv64` — 64-bit RISC-V
+| Name            | Description and example devices    |
+|-----------------|------------------------------------|
+| `x86_64`        | 64-bit x86 (Linux, macOS, FreeBSD) |
+| `aarch64`       | 64-bit ARM (Linux, macOS)          |
+| `arm32`         | 32-bit ARM (Linux)                 |
+| `armv6m`        | ARM Cortex-M0+ (Raspberry Pi Pico, STM32 with Cortex-M0/M0+) |
+| `armv6m+thumb2` | ARM Cortex-M3+ with Thumb-2 support, ARMv7-M or later (Raspberry Pi Pico 2, STM32 with Cortex-M3/M4/M7/M33) |
+| `riscv32`       | 32-bit RISC-V (ESP32Cx, ESP32Hx, ESP32P4)  |
+| `riscv64`       | 64-bit RISC-V (Linux)              |
+| `wasm32`        | WebAssembly (nodeJS, browsers)     |
+| `xtensa`        | ESP32, ESP32Sx                     |
 
 ### Requirements
 
@@ -58,6 +64,7 @@ When enabled, each precompiled module includes an ELF object with DWARF debug se
 * Label symbols
 * Source file and line number mappings
 * Context structure type information for inspecting VM registers
+* Named variable locations (when compiled with `beam_debug_info`, OTP 28+)
 
 ## DWARF debug support
 
@@ -94,7 +101,58 @@ The DWARF debug information includes location tracking for Erlang x registers. U
 
 The x register values are displayed as raw tagged terms. For small integers, the value is `(term >> 4)`, so `x[0] = 143` means the integer `8` (since `143 = 8 << 4 | 0xf`).
 
-When the JIT compiler has cached an x register in a native CPU register, the debugger reads it directly from the CPU register instead of memory — this is tracked automatically through DWARF location lists.
+When the JIT compiler has cached an x register in a native CPU register, the debugger reads it directly from the CPU register instead of memory, this is tracked automatically through DWARF location lists.
+
+#### Named variable inspection
+
+When an Erlang module is compiled with the `beam_debug_info` option (OTP 28+), the compiler emits `debug_line` opcodes that carry variable-to-register mappings. The JIT DWARF backend uses these to generate named variable entries, so the debugger can display Erlang variable names instead of raw register indices.
+
+To enable this, add `beam_debug_info` as a compile attribute in your module:
+
+```erlang
+-compile([beam_debug_info]).
+```
+
+Or pass it as a compiler flag:
+
+```shell
+$ erlc +beam_debug_info my_module.erl
+```
+
+```{warning}
+The `beam_debug_info` option disables several compiler optimizations (constant folding,
+binary match optimization, etc.) to preserve variable-to-register mappings. Use it only
+for modules you intend to debug, not for production builds.
+```
+
+With `beam_debug_info` enabled, the debugger shows named variables:
+
+```
+$ lldb -- ./AtomVM my_module.avm
+(lldb) settings set plugin.jit-loader.gdb.enable on
+(lldb) breakpoint set -f my_module.erl -l 10
+(lldb) run
+```
+
+```
+Process stopped
+* thread #1, stop reason = breakpoint 1.1
+    frame #0: JIT`my_module:my_fun/1(ctx=0x...) at my_module.erl:10
+(lldb) frame variable N M
+(unsigned long) N = 687
+(unsigned long) M = 703
+```
+
+The variables are displayed as raw tagged terms, just like x registers. Use `term_to_int()` to convert small integers:
+
+```
+(lldb) print term_to_int(N)
+(avm_int_t) 42
+(lldb) print term_to_int(M)
+(avm_int_t) 43
+```
+
+The variable locations are tracked through DWARF location lists, so the debugger shows the correct value at each point in the function. A variable that moves from one register to another (or goes out of scope) is handled automatically.
 
 #### Backtraces
 
@@ -108,13 +166,33 @@ When the JIT compiler has cached an x register in a native CPU register, the deb
 
 #### Source line mapping
 
-If the Erlang source was compiled with debug information and the BEAM Line chunk is present, the debugger maps JIT code addresses to source file and line numbers.
+If the Erlang source was compiled with debug information and the BEAM Line chunk is present, the debugger maps JIT code addresses to source file and line numbers. You can set breakpoints by file and line:
+
+```
+(lldb) breakpoint set -f my_module.erl -l 15
+```
 
 ```{note}
-LLDB 19 (including Apple's system LLDB shipped with Xcode) has a regression in the JIT loader
-that causes hangs when resolving breakpoints in JIT-loaded modules. Use LLDB 20 or later.
-On macOS, install it from [MacPorts](https://www.macports.org/) (`port install lldb-20`) or
-build from the [LLVM project source](https://github.com/llvm/llvm-project).
+Upstream LLVM LLDB 19 and Apple LLDB versions earlier than `lldb-2100` (shipped in Xcode 26.4 and later) hang when resolving pending source-line breakpoints against JIT-emitted DWARF.
+
+Workarounds without changing lldb:
+
+* Set breakpoints by symbol name (`breakpoint set -n 'mod:fun/N'`) instead of file/line
+* Defer source-line breakpoints until after the relevant module has been JIT-registered (e.g. break first on a symbol, then add the source-line breakpoint, then continue).
+
+For a fresh lldb:
+
+* On macOS 26, the LLDB shipped with the CommandLineTools is already at `lldb-2100` (independent of the active Xcode), so a quick fix is to invoke it directly:
+
+```shell
+$ /Library/Developer/CommandLineTools/usr/bin/lldb -- ...
+```
+
+Alternatively, switch the active Xcode to 26.4 or later (`sudo xcode-select -s /Applications/Xcode_26.4.app`).
+
+* On any platform, install upstream LLDB 20 or later with `sudo port install lldb-20` from [MacPorts](https://www.macports.org/), `brew install llvm` (Homebrew), or build from the [LLVM project source](https://github.com/llvm/llvm-project). A self-signed `lldb` binary on macOS needs a debugger entitlement.
+
+`lldb --version` reports the version: `lldb-1703.x` and earlier are affected; `lldb-2100.x` and upstream LLDB 20+ are fixed.
 ```
 
 ### Disassembling precompiled modules
@@ -156,6 +234,9 @@ $ objdump -d module.elf
 # aarch64
 $ aarch64-elf-objdump -d module.elf
 
+# arm32
+$ arm-elf-objdump -d module.elf
+
 # armv6m
 $ arm-elf-objdump -d --disassembler-options=force-thumb module.elf
 
@@ -172,5 +253,4 @@ $ riscv64-elf-objdump -d module.elf
 |--------|---------|-------------|
 | `AVM_DISABLE_JIT` | `ON` | Disable JIT compilation |
 | `AVM_DISABLE_JIT_DWARF` | `ON` | Disable DWARF debug information in JIT |
-| `AVM_JIT_TARGET_ARCH` | auto-detected | Target architecture (`x86_64`, `aarch64`, `armv6m`, `riscv32`, `riscv64`) |
-| `AVM_DISABLE_SMP` | `OFF` | Disable SMP support |
+| `AVM_JIT_TARGET_ARCH` | auto-detected | Target architecture (`x86_64`, `aarch64`, `arm32`, `armv6m`, `armv6m+thumb2`, `riscv32`, `riscv64`, `wasm32`, `xtensa`) |

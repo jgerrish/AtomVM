@@ -83,6 +83,7 @@
     dwarf_label/2,
     dwarf_function/3,
     dwarf_line/2,
+    dwarf_variables/2,
     dwarf_ctx_register/0
 ]).
 -endif.
@@ -153,11 +154,11 @@
     stream_module :: module(),
     stream :: stream(),
     offset :: non_neg_integer(),
-    branches :: [{non_neg_integer(), non_neg_integer(), non_neg_integer()}],
+    branches :: #{integer() | reference() => [{non_neg_integer(), non_neg_integer()}]},
     jump_table_start :: non_neg_integer(),
     available_regs :: non_neg_integer(),
     used_regs :: non_neg_integer(),
-    labels :: [{integer() | reference(), integer()}],
+    labels :: #{integer() | reference() => integer()},
     variant :: non_neg_integer(),
     regs :: jit_regs:regs()
 }).
@@ -285,12 +286,12 @@ new(Variant, StreamModule, Stream) ->
     #state{
         stream_module = StreamModule,
         stream = Stream,
-        branches = [],
+        branches = #{},
         jump_table_start = 0,
         offset = StreamModule:offset(Stream),
         available_regs = ?AVAILABLE_REGS_MASK,
         used_regs = 0,
-        labels = [],
+        labels = #{},
         variant = Variant,
         regs = jit_regs:new()
     }.
@@ -464,27 +465,25 @@ patch_branch(StreamModule, Stream, Offset, Type, LabelOffset) ->
 -spec patch_branches_for_label(
     module(),
     stream(),
-    integer(),
+    integer() | reference(),
     non_neg_integer(),
-    [{integer(), non_neg_integer(), any()}]
-) -> {stream(), [{integer(), non_neg_integer(), any()}]}.
+    #{integer() | reference() => [{non_neg_integer(), non_neg_integer()}]}
+) ->
+    {stream(), #{integer() | reference() => [{non_neg_integer(), non_neg_integer()}]}}.
 patch_branches_for_label(StreamModule, Stream, TargetLabel, LabelOffset, Branches) ->
-    patch_branches_for_label(StreamModule, Stream, TargetLabel, LabelOffset, Branches, []).
-
-patch_branches_for_label(_StreamModule, Stream, _TargetLabel, _LabelOffset, [], Acc) ->
-    {Stream, lists:reverse(Acc)};
-patch_branches_for_label(
-    StreamModule,
-    Stream0,
-    TargetLabel,
-    LabelOffset,
-    [{Label, Offset, Type} | Rest],
-    Acc
-) when Label =:= TargetLabel ->
-    Stream1 = patch_branch(StreamModule, Stream0, Offset, Type, LabelOffset),
-    patch_branches_for_label(StreamModule, Stream1, TargetLabel, LabelOffset, Rest, Acc);
-patch_branches_for_label(StreamModule, Stream, TargetLabel, LabelOffset, [Branch | Rest], Acc) ->
-    patch_branches_for_label(StreamModule, Stream, TargetLabel, LabelOffset, Rest, [Branch | Acc]).
+    case Branches of
+        #{TargetLabel := BrList} ->
+            Stream1 = lists:foldl(
+                fun({Offset, Type}, AccStream) ->
+                    patch_branch(StreamModule, AccStream, Offset, Type, LabelOffset)
+                end,
+                Stream,
+                BrList
+            ),
+            {Stream1, maps:remove(TargetLabel, Branches)};
+        _ ->
+            {Stream, Branches}
+    end.
 
 %%-----------------------------------------------------------------------------
 %% @doc Rewrite stream to update all branches for labels.
@@ -493,19 +492,29 @@ patch_branches_for_label(StreamModule, Stream, TargetLabel, LabelOffset, [Branch
 %% @return Updated backend state
 %%-----------------------------------------------------------------------------
 -spec update_branches(state()) -> state().
-update_branches(#state{branches = []} = State) ->
-    State;
 update_branches(
     #state{
         stream_module = StreamModule,
         stream = Stream0,
-        branches = [{Label, Offset, Type} | BranchesT],
+        branches = Branches,
         labels = Labels
     } = State
 ) ->
-    {Label, LabelOffset} = lists:keyfind(Label, 1, Labels),
-    Stream1 = patch_branch(StreamModule, Stream0, Offset, Type, LabelOffset),
-    update_branches(State#state{stream = Stream1, branches = BranchesT}).
+    Stream1 = maps:fold(
+        fun(Label, BrList, AccStream) ->
+            #{Label := LabelOffset} = Labels,
+            lists:foldl(
+                fun({Offset, Type}, AccStream2) ->
+                    patch_branch(StreamModule, AccStream2, Offset, Type, LabelOffset)
+                end,
+                AccStream,
+                BrList
+            )
+        end,
+        Stream0,
+        Branches
+    ),
+    State#state{stream = Stream1, branches = #{}}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Emit a call (call with return) to a primitive with arguments. This
@@ -592,7 +601,7 @@ call_primitive_last(
         stream = Stream3,
         available_regs = ?AVAILABLE_REGS_MASK,
         used_regs = 0,
-        regs = jit_regs:invalidate_all(State1#state.regs)
+        regs = jit_regs:unreachable(State1#state.regs)
     }.
 
 %%-----------------------------------------------------------------------------
@@ -649,19 +658,24 @@ jump_to_label(
     Label
 ) ->
     Offset = StreamModule:offset(Stream0),
-    case lists:keyfind(Label, 1, Labels) of
-        {Label, LabelOffset} ->
+    case Labels of
+        #{Label := LabelOffset} ->
             % Label is already known, emit direct branch without relocation
             Rel = LabelOffset - Offset,
             I1 = jit_aarch64_asm:b(Rel),
             Stream1 = StreamModule:append(Stream0, I1),
-            State#state{stream = Stream1};
-        false ->
+            State#state{stream = Stream1, regs = jit_regs:unreachable(State#state.regs)};
+        _ ->
             % Label not yet known, emit placeholder and add relocation
             I1 = jit_aarch64_asm:b(0),
-            Reloc = {Label, Offset, b},
+            BrEntry = {Offset, b},
+            ExistingBrs = maps:get(Label, AccBranches, []),
             Stream1 = StreamModule:append(Stream0, I1),
-            State#state{stream = Stream1, branches = [Reloc | AccBranches]}
+            State#state{
+                stream = Stream1,
+                branches = AccBranches#{Label => [BrEntry | ExistingBrs]},
+                regs = jit_regs:unreachable(State#state.regs)
+            }
     end.
 
 jump_to_offset(#state{stream_module = StreamModule, stream = Stream0} = State, TargetOffset) ->
@@ -669,7 +683,7 @@ jump_to_offset(#state{stream_module = StreamModule, stream = Stream0} = State, T
     Rel = TargetOffset - Offset,
     I1 = jit_aarch64_asm:b(Rel),
     Stream1 = StreamModule:append(Stream0, I1),
-    State#state{stream = Stream1}.
+    State#state{stream = Stream1, regs = jit_regs:unreachable(State#state.regs)}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Jump to a continuation address stored in a register.
@@ -708,7 +722,7 @@ jump_to_continuation(
         stream = Stream1,
         available_regs = ?AVAILABLE_REGS_MASK,
         used_regs = 0,
-        regs = jit_regs:invalidate_all(State#state.regs)
+        regs = jit_regs:unreachable(State#state.regs)
     }.
 
 %% @private
@@ -719,6 +733,10 @@ rewrite_branch_instruction({cbnz, Reg}, Offset) ->
     jit_aarch64_asm:cbnz(Reg, Offset);
 rewrite_branch_instruction({cbnz_w, Reg}, Offset) ->
     jit_aarch64_asm:cbnz_w(Reg, Offset);
+rewrite_branch_instruction({cbz, Reg}, Offset) ->
+    jit_aarch64_asm:cbz(Reg, Offset);
+rewrite_branch_instruction({cbz_w, Reg}, Offset) ->
+    jit_aarch64_asm:cbz_w(Reg, Offset);
 rewrite_branch_instruction({tbz, Reg, Bit}, Offset) ->
     jit_aarch64_asm:tbz(Reg, Bit, Offset);
 rewrite_branch_instruction({tbnz, Reg, Bit}, Offset) ->
@@ -961,6 +979,20 @@ if_block_cond(
     {State2, ne, byte_size(I1)};
 if_block_cond(
     #state{stream_module = StreamModule, stream = Stream0} = State0,
+    {RegOrTuple, '!=', 0}
+) ->
+    Reg =
+        case RegOrTuple of
+            {free, Reg0} -> Reg0;
+            RegOrTuple -> RegOrTuple
+        end,
+    I = jit_aarch64_asm:cbz(Reg, 0),
+    Stream1 = StreamModule:append(Stream0, I),
+    State1 = if_block_free_reg(RegOrTuple, State0),
+    State2 = State1#state{stream = Stream1},
+    {State2, {cbz, Reg}, 0};
+if_block_cond(
+    #state{stream_module = StreamModule, stream = Stream0} = State0,
     {RegOrTuple, '!=', Val}
 ) when is_integer(Val) orelse ?IS_GPR(Val) ->
     Reg =
@@ -978,6 +1010,20 @@ if_block_cond(
     State1 = if_block_free_reg(RegOrTuple, State0),
     State2 = State1#state{stream = Stream1},
     {State2, eq, byte_size(I1)};
+if_block_cond(
+    #state{stream_module = StreamModule, stream = Stream0} = State0,
+    {'(int)', RegOrTuple, '!=', 0}
+) ->
+    Reg =
+        case RegOrTuple of
+            {free, Reg0} -> Reg0;
+            RegOrTuple -> RegOrTuple
+        end,
+    I = jit_aarch64_asm:cbz_w(Reg, 0),
+    Stream1 = StreamModule:append(Stream0, I),
+    State1 = if_block_free_reg(RegOrTuple, State0),
+    State2 = State1#state{stream = Stream1},
+    {State2, {cbz_w, Reg}, 0};
 if_block_cond(
     #state{stream_module = StreamModule, stream = Stream0} = State0,
     {'(int)', RegOrTuple, '!=', Val}
@@ -1604,7 +1650,7 @@ move_to_vm_register_emit(#state{available_regs = AR0} = State0, N, Dest) when
     State1 = move_to_vm_register_emit(
         State0#state{stream = Stream1, available_regs = AT}, Temp, Dest
     ),
-    Regs1 = jit_regs:invalidate_reg(State1#state.regs, Temp),
+    Regs1 = jit_regs:set_contents(State1#state.regs, Temp, {imm, N}),
     State1#state{available_regs = AR0, regs = Regs1};
 % Source is a VM register
 move_to_vm_register_emit(#state{available_regs = AR0} = State0, {x_reg, extra}, Dest) ->
@@ -1616,7 +1662,7 @@ move_to_vm_register_emit(#state{available_regs = AR0} = State0, {x_reg, extra}, 
     State1 = move_to_vm_register_emit(
         State0#state{stream = Stream1, available_regs = AT}, Temp, Dest
     ),
-    Regs1 = jit_regs:invalidate_reg(State1#state.regs, Temp),
+    Regs1 = jit_regs:set_contents(State1#state.regs, Temp, {x_reg, ?MAX_REG}),
     State1#state{available_regs = AR0, regs = Regs1};
 move_to_vm_register_emit(#state{available_regs = AR0} = State0, {x_reg, X}, Dest) ->
     Temp = first_avail(AR0),
@@ -1627,7 +1673,7 @@ move_to_vm_register_emit(#state{available_regs = AR0} = State0, {x_reg, X}, Dest
     State1 = move_to_vm_register_emit(
         State0#state{stream = Stream1, available_regs = AT}, Temp, Dest
     ),
-    Regs1 = jit_regs:invalidate_reg(State1#state.regs, Temp),
+    Regs1 = jit_regs:set_contents(State1#state.regs, Temp, {x_reg, X}),
     State1#state{available_regs = AR0, regs = Regs1};
 move_to_vm_register_emit(#state{available_regs = AR0} = State0, {ptr, Reg}, Dest) ->
     Temp = first_avail(AR0),
@@ -1650,7 +1696,7 @@ move_to_vm_register_emit(#state{available_regs = AR0} = State0, {y_reg, Y}, Dest
     State1 = move_to_vm_register_emit(
         State0#state{stream = Stream1, available_regs = AT}, Temp, Dest
     ),
-    Regs1 = jit_regs:invalidate_reg(State1#state.regs, Temp),
+    Regs1 = jit_regs:set_contents(State1#state.regs, Temp, {y_reg, Y}),
     State1#state{available_regs = AR0, regs = Regs1};
 % term_to_float
 move_to_vm_register_emit(
@@ -1695,7 +1741,7 @@ move_array_element(
     I2 = jit_aarch64_asm:str(Temp, ?X_REG(X)),
     Stream1 = StreamModule:append(Stream0, <<I1/binary, I2/binary>>),
     Regs1 = jit_regs:invalidate_vm_loc(Regs0, {x_reg, X}),
-    Regs2 = jit_regs:invalidate_reg(Regs1, Temp),
+    Regs2 = jit_regs:set_contents(Regs1, Temp, {x_reg, X}),
     State#state{stream = Stream1, regs = Regs2};
 move_array_element(
     #state{stream_module = StreamModule, stream = Stream0, available_regs = Available, regs = Regs0} =
@@ -2186,33 +2232,39 @@ move_to_native_register(
     Regs1 = jit_regs:set_contents(Regs0, RegDst, {imm, RegSrc}),
     State#state{stream = Stream1, regs = Regs1};
 move_to_native_register(
-    #state{stream_module = StreamModule, stream = Stream0} = State, {ptr, Reg}, RegDst
+    #state{stream_module = StreamModule, stream = Stream0, regs = Regs0} = State, {ptr, Reg}, RegDst
 ) when ?IS_GPR(Reg) ->
     I1 = jit_aarch64_asm:ldr(RegDst, {Reg, 0}),
     Stream1 = StreamModule:append(Stream0, I1),
-    State#state{stream = Stream1};
+    Regs1 = jit_regs:invalidate_reg(Regs0, RegDst),
+    State#state{stream = Stream1, regs = Regs1};
 move_to_native_register(
-    #state{stream_module = StreamModule, stream = Stream0} = State, {x_reg, extra}, RegDst
+    #state{stream_module = StreamModule, stream = Stream0, regs = Regs0} = State,
+    {x_reg, extra},
+    RegDst
 ) ->
     I1 = jit_aarch64_asm:ldr(RegDst, ?X_REG(?MAX_REG)),
     Stream1 = StreamModule:append(Stream0, I1),
-    State#state{stream = Stream1};
+    Regs1 = jit_regs:set_contents(Regs0, RegDst, {x_reg, extra}),
+    State#state{stream = Stream1, regs = Regs1};
 move_to_native_register(
-    #state{stream_module = StreamModule, stream = Stream0} = State, {x_reg, X}, RegDst
+    #state{stream_module = StreamModule, stream = Stream0, regs = Regs0} = State, {x_reg, X}, RegDst
 ) when
     X < ?MAX_REG
 ->
     I1 = jit_aarch64_asm:ldr(RegDst, ?X_REG(X)),
     Stream1 = StreamModule:append(Stream0, I1),
-    State#state{stream = Stream1};
+    Regs1 = jit_regs:set_contents(Regs0, RegDst, {x_reg, X}),
+    State#state{stream = Stream1, regs = Regs1};
 move_to_native_register(
-    #state{stream_module = StreamModule, stream = Stream0} = State, {y_reg, Y}, RegDst
+    #state{stream_module = StreamModule, stream = Stream0, regs = Regs0} = State, {y_reg, Y}, RegDst
 ) ->
     I1 = jit_aarch64_asm:ldr(RegDst, ?Y_REGS),
     I2 = jit_aarch64_asm:ldr(RegDst, {RegDst, Y * ?WORD_SIZE}),
     Code = <<I1/binary, I2/binary>>,
     Stream1 = StreamModule:append(Stream0, Code),
-    State#state{stream = Stream1}.
+    Regs1 = jit_regs:set_contents(Regs0, RegDst, {y_reg, Y}),
+    State#state{stream = Stream1, regs = Regs1}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Copy a value to a native register, allocating a new register from the
@@ -2295,7 +2347,7 @@ move_to_cp(
     I3 = jit_aarch64_asm:str(Reg, ?CP),
     Code = <<I1/binary, I2/binary, I3/binary>>,
     Stream1 = StreamModule:append(Stream0, Code),
-    Regs1 = jit_regs:invalidate_reg(Regs0, Reg),
+    Regs1 = jit_regs:set_contents(Regs0, Reg, {y_reg, Y}),
     State#state{stream = Stream1, regs = Regs1}.
 
 %%-----------------------------------------------------------------------------
@@ -2343,21 +2395,26 @@ set_continuation_to_label(
     Temp = first_avail(Avail),
     Offset = StreamModule:offset(Stream0),
     Regs1 = jit_regs:invalidate_reg(Regs0, Temp),
-    case lists:keyfind(Label, 1, Labels) of
-        {Label, LabelOffset} ->
+    case Labels of
+        #{Label := LabelOffset} ->
             Rel = LabelOffset - Offset,
             I1 = jit_aarch64_asm:adr(Temp, Rel),
             I2 = jit_aarch64_asm:str(Temp, ?JITSTATE_CONTINUATION),
             Code = <<I1/binary, I2/binary>>,
             Stream1 = StreamModule:append(Stream0, Code),
             State#state{stream = Stream1, regs = Regs1};
-        false ->
+        _ ->
             I1 = jit_aarch64_asm:adr(Temp, 0),
-            Reloc = {Label, Offset, {adr, Temp}},
+            BrEntry = {Offset, {adr, Temp}},
             I2 = jit_aarch64_asm:str(Temp, ?JITSTATE_CONTINUATION),
             Code = <<I1/binary, I2/binary>>,
             Stream1 = StreamModule:append(Stream0, Code),
-            State#state{stream = Stream1, branches = [Reloc | Branches], regs = Regs1}
+            ExistingBrs = maps:get(Label, Branches, []),
+            State#state{
+                stream = Stream1,
+                branches = Branches#{Label => [BrEntry | ExistingBrs]},
+                regs = Regs1
+            }
     end.
 
 %%-----------------------------------------------------------------------------
@@ -2382,12 +2439,19 @@ set_continuation_to_offset(
     OffsetRef = make_ref(),
     Offset = StreamModule:offset(Stream0),
     I1 = jit_aarch64_asm:adr(Temp, 0),
-    Reloc = {OffsetRef, Offset, {adr, Temp}},
+    BrEntry = {Offset, {adr, Temp}},
     I2 = jit_aarch64_asm:str(Temp, ?JITSTATE_CONTINUATION),
     Code = <<I1/binary, I2/binary>>,
     Stream1 = StreamModule:append(Stream0, Code),
     Regs1 = jit_regs:invalidate_reg(Regs0, Temp),
-    {State#state{stream = Stream1, branches = [Reloc | Branches], regs = Regs1}, OffsetRef}.
+    {
+        State#state{
+            stream = Stream1,
+            branches = Branches#{OffsetRef => [BrEntry]},
+            regs = Regs1
+        },
+        OffsetRef
+    }.
 
 %%-----------------------------------------------------------------------------
 %% @doc Implement a continuation entry point. On AArch64 this is a nop
@@ -2423,7 +2487,7 @@ get_module_index(
     I2 = jit_aarch64_asm:ldr_w(Reg, ?MODULE_INDEX(Reg)),
     Code = <<I1/binary, I2/binary>>,
     Stream1 = StreamModule:append(Stream0, Code),
-    Regs1 = jit_regs:invalidate_reg(Regs0, Reg),
+    Regs1 = jit_regs:set_contents(Regs0, Reg, module_index),
     {
         State#state{
             stream = Stream1,
@@ -2724,9 +2788,8 @@ decrement_reductions_and_maybe_schedule_next(
         Stream3, BNEOffset, <<NewI4/binary, NewI5/binary>>
     ),
     State3 = merge_used_regs(State2#state{stream = Stream4}, State1#state.used_regs),
-    %% The schedule_next path is a tail call (dead end), so the register tracking
-    %% from the non-taken path (State1) is what matters at the continuation.
-    State3#state{regs = State1#state.regs}.
+    %% schedule_next clobbers caller-saved regs; invalidate cache at continuation.
+    State3#state{regs = jit_regs:invalidate_all(State1#state.regs)}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Emit a call to a label with automatic scheduling. Decrements reductions
@@ -2773,20 +2836,24 @@ call_only_or_schedule_next(
     Stream1 = StreamModule:append(Stream0, <<I1/binary, I2/binary, I3/binary>>),
     BNEOffset = StreamModule:offset(Stream1),
 
-    case lists:keyfind(Label, 1, Labels) of
-        {Label, LabelOffset} ->
+    case Labels of
+        #{Label := LabelOffset} ->
             % Label is already known, emit direct branch with calculated offset
             % Calculate relative offset (must be 4-byte aligned)
             Rel = LabelOffset - BNEOffset,
             I4 = jit_aarch64_asm:bcc(ne, Rel),
             Stream2 = StreamModule:append(Stream1, I4),
             State1 = State0#state{stream = Stream2};
-        false ->
+        _ ->
             % Label not yet known, emit placeholder and add relocation
             I4 = jit_aarch64_asm:bcc(ne, 0),
-            Reloc1 = {Label, BNEOffset, {bcc, ne}},
+            BrEntry = {BNEOffset, {bcc, ne}},
+            ExistingBrs = maps:get(Label, Branches, []),
             Stream2 = StreamModule:append(Stream1, I4),
-            State1 = State0#state{stream = Stream2, branches = [Reloc1 | Branches]}
+            State1 = State0#state{
+                stream = Stream2,
+                branches = Branches#{Label => [BrEntry | ExistingBrs]}
+            }
     end,
     State2 = set_continuation_to_label(State1, Label),
     call_primitive_last(State2, ?PRIM_SCHEDULE_NEXT_CP, [ctx, jit_state]).
@@ -2884,7 +2951,7 @@ return_labels_and_lines(
 ) ->
     SortedLabels = lists:keysort(2, [
         {Label, LabelOffset}
-     || {Label, LabelOffset} <- Labels, is_integer(Label)
+     || {Label, LabelOffset} <- maps:to_list(Labels), is_integer(Label)
     ]),
 
     I1 = jit_aarch64_asm:adr(r0, 8),
@@ -3039,10 +3106,10 @@ add_label(
     ),
 
     State#state{
-        stream = Stream2, branches = RemainingBranches, labels = [{Label, LabelOffset} | Labels]
+        stream = Stream2, branches = RemainingBranches, labels = Labels#{Label => LabelOffset}
     };
 add_label(#state{labels = Labels} = State, Label, Offset) ->
-    State#state{labels = [{Label, Offset} | Labels]}.
+    State#state{labels = Labels#{Label => Offset}}.
 
 -ifdef(JIT_DWARF).
 %%-----------------------------------------------------------------------------

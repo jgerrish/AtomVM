@@ -29,7 +29,6 @@ set(ERLANG_MODULES
     gpio_hal
     i2c_hal
     i2s_hal
-    json_encoder
     logger_manager
     port
     spi_hal
@@ -38,7 +37,7 @@ set(ERLANG_MODULES
     uart_hal
 )
 
-pack_archive(eavmlib ${ERLANG_MODULES})
+pack_precompiled_archive(eavmlib ${ERLANG_MODULES})
 
 include(../../../version.cmake)
 

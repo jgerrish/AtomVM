@@ -28,7 +28,7 @@
 
 #ifndef AVM_CREATE_STACKTRACES
 
-term stacktrace_create_raw(Context *ctx, Module *mod, int current_offset)
+term stacktrace_create_raw(Context *ctx, Module *mod, size_t current_offset)
 {
     UNUSED(ctx);
     UNUSED(mod);
@@ -37,7 +37,7 @@ term stacktrace_create_raw(Context *ctx, Module *mod, int current_offset)
     return context_exception_class(ctx);
 }
 
-term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, term module_atom, term function_atom, int arity)
+term stacktrace_create_raw_mfa(Context *ctx, Module *mod, size_t current_offset, term module_atom, term function_atom, int arity)
 {
     UNUSED(ctx);
     UNUSED(mod);
@@ -102,19 +102,39 @@ static bool location_sets_append(GlobalContext *global, Module *mod, const uint8
     return true;
 }
 
-term stacktrace_create_raw(Context *ctx, Module *mod, int current_offset)
+term stacktrace_create_raw(Context *ctx, Module *mod, size_t current_offset)
 {
     return stacktrace_create_raw_mfa(ctx, mod, current_offset, UNDEFINED_ATOM, UNDEFINED_ATOM, 0);
 }
 
-term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, term module_atom, term function_atom, int arity)
+term stacktrace_create_raw_mfa(Context *ctx, Module *mod, size_t current_offset, term module_atom, term function_atom, int arity)
 {
     term exception_class = context_exception_class(ctx);
 
-    if (term_is_nonempty_list(ctx->exception_stacktrace)) {
-        // there is already a built stacktrace, nothing to do here
-        // (this happens when re-raising with raise/3
-        return ctx->exception_stacktrace;
+    if (term_is_list(ctx->exception_stacktrace)) {
+        // Already a built stacktrace (possibly empty) from erlang:raise/3
+        // NIF (via RAISE_WITH_STACKTRACE) or OP_RAW_RAISE. Wrap it in a raw
+        // 6-tuple so OP_RAISE can extract the exception class and
+        // stacktrace_build can return the list as-is.
+        ctx->x[0] = ctx->exception_stacktrace;
+        ctx->x[1] = ctx->exception_reason;
+        // NOLINT(term-use-after-gc) exception_class is always an atom
+        if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(6), 2, ctx->x, MEMORY_CAN_SHRINK)
+                != MEMORY_GC_OK)) {
+            fprintf(stderr, "WARNING: Unable to allocate heap space for raw stacktrace\n");
+            return OUT_OF_MEMORY_ATOM;
+        }
+        ctx->exception_stacktrace = ctx->x[0];
+        ctx->exception_reason = ctx->x[1];
+        term built_stacktrace = ctx->exception_stacktrace;
+        term stack_info = term_alloc_tuple(6, &ctx->heap);
+        term_put_tuple_element(stack_info, 0, term_from_int(0));
+        term_put_tuple_element(stack_info, 1, term_from_int(0));
+        term_put_tuple_element(stack_info, 2, term_from_int(0));
+        term_put_tuple_element(stack_info, 3, term_from_int(0));
+        term_put_tuple_element(stack_info, 4, built_stacktrace);
+        term_put_tuple_element(stack_info, 5, exception_class);
+        return stack_info;
     }
 
     // Check if EXCEPTION_USE_LIVE_REGS_FLAG is set
@@ -130,7 +150,7 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
     unsigned int num_aux_terms = 0;
     size_t filename_lens = 0;
     Module *prev_mod = NULL;
-    long prev_mod_offset = -1;
+    size_t prev_mod_offset = (size_t) -1;
     term *ct = ctx->e;
     term *stack_base = context_stack_base(ctx);
 
@@ -141,7 +161,7 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
         if (term_is_cp(*ct)) {
 
             Module *cp_mod;
-            long mod_offset;
+            size_t mod_offset;
 
             module_cp_to_label_offset(*ct, &cp_mod, NULL, NULL, &mod_offset, ctx->global);
             // TODO: investigate
@@ -167,7 +187,7 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
             int label = term_to_catch_label_and_module(*ct, &module_index);
 
             Module *cl_mod = globalcontext_get_module_by_index(ctx->global, module_index);
-            int mod_offset = module_label_code_offset(cl_mod, label);
+            size_t mod_offset = module_label_code_offset(cl_mod, label);
 
             if (!(prev_mod == cl_mod && mod_offset == prev_mod_offset)) {
                 ++num_frames;
@@ -194,7 +214,7 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
         uint32_t line;
         const uint8_t *filename;
         size_t filename_len;
-        if (LIKELY(module_find_line(mod, (unsigned int) current_offset, &line, &filename_len, &filename))) {
+        if (LIKELY(module_find_line(mod, current_offset, &line, &filename_len, &filename))) {
             if (!location_sets_append(ctx->global, mod, filename, filename_len, &filename_lens, &locations, &num_locations)) {
                 return UNDEFINED_ATOM;
             }
@@ -235,10 +255,6 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
 
     term frame_info;
 
-    // on OTP <= 22 module_atom is set to erlang, when calling a function such as erlang:throw
-    // making this heuristic unreliable since hides the throw caller from the stacktrace
-    // this means that either this heuristic is not 100% correct, or something changed in OTP-23
-    // anyway on OTP >= 23 seem to work as expected.
     if (module_atom == UNDEFINED_ATOM) {
         // module_atom has not been provided, let's use mod->module_index
 
@@ -273,14 +289,14 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
     raw_stacktrace = term_list_prepend(frame_info, raw_stacktrace, &ctx->heap);
 
     prev_mod = NULL;
-    prev_mod_offset = -1;
+    prev_mod_offset = (size_t) -1;
     // GC may have moved stack
     ct = ctx->e;
     stack_base = context_stack_base(ctx);
     while (ct != stack_base) {
         if (term_is_cp(*ct)) {
             Module *cp_mod;
-            long mod_offset;
+            size_t mod_offset;
 
             module_cp_to_label_offset(*ct, &cp_mod, NULL, NULL, &mod_offset, ctx->global);
             if (mod_offset != cp_mod->end_instruction_ii && !(prev_mod == cp_mod && mod_offset == prev_mod_offset)) {
@@ -299,7 +315,7 @@ term stacktrace_create_raw_mfa(Context *ctx, Module *mod, int current_offset, te
             int module_index;
             int label = term_to_catch_label_and_module(*ct, &module_index);
             Module *cl_mod = globalcontext_get_module_by_index(ctx->global, module_index);
-            int mod_offset = module_label_code_offset(cl_mod, label);
+            size_t mod_offset = module_label_code_offset(cl_mod, label);
 
             if (!(prev_mod == cl_mod && mod_offset == prev_mod_offset)) {
 
@@ -365,12 +381,6 @@ term stacktrace_build(Context *ctx, term *stack_info, uint32_t live)
 {
     GlobalContext *glb = ctx->global;
 
-    if (term_is_nonempty_list(*stack_info)) {
-        // stacktrace has been already built. Nothing to do here
-        // This may happen when re-raising with raise/3
-        return *stack_info;
-    }
-
     if (*stack_info == OUT_OF_MEMORY_ATOM) {
         return *stack_info;
     }
@@ -382,6 +392,15 @@ term stacktrace_build(Context *ctx, term *stack_info, uint32_t live)
     int num_aux_terms = term_to_int(term_get_tuple_element(*stack_info, 1));
     int filename_lens = term_to_int(term_get_tuple_element(*stack_info, 2));
     int num_mods = term_to_int(term_get_tuple_element(*stack_info, 3));
+
+    // Pre-built stacktrace from erlang:raise/3: element 4 already holds
+    // the built list, num_frames == 0. Return the list directly.
+    if (num_frames == 0) {
+        term raw_stacktrace = term_get_tuple_element(*stack_info, 4);
+        if (term_is_list(raw_stacktrace)) {
+            return raw_stacktrace;
+        }
+    }
 
     struct ModulePathPair *module_paths = malloc(num_mods * sizeof(struct ModulePathPair));
     if (IS_NULL_PTR(module_paths)) {
@@ -415,7 +434,7 @@ term stacktrace_build(Context *ctx, term *stack_info, uint32_t live)
 
         Module *cp_mod;
         int label;
-        long mod_offset;
+        size_t mod_offset;
         module_cp_to_label_offset(cp, &cp_mod, &label, NULL, &mod_offset, ctx->global);
 
         term module_name = module_get_name(cp_mod);

@@ -149,6 +149,7 @@ compile_minimal_x86_64_test() ->
         fun(_) -> undefined end,
         fun(_) -> any end,
         fun(_) -> undefined end,
+        fun(_) -> false end,
         jit_x86_64,
         Stream2
     ),
@@ -195,10 +196,18 @@ compile_stream_for_backend(Backend, CodeChunk, AtomChunk, TypeChunk, ImportResol
     AtomResolver = jit_precompile:atom_resolver(AtomChunk),
     LiteralResolver = fun(_) -> test_literal end,
     TypeResolver = jit_precompile:type_resolver(TypeChunk),
+    DebugResolver = fun(_) -> false end,
 
     % Compile with typed register support
     {LabelsCount, Stream3} = jit:compile(
-        CodeChunk, AtomResolver, LiteralResolver, TypeResolver, ImportResolver, Backend, Stream2
+        CodeChunk,
+        AtomResolver,
+        LiteralResolver,
+        TypeResolver,
+        ImportResolver,
+        DebugResolver,
+        Backend,
+        Stream2
     ),
     compile_stream_finalize_for_backend(Backend, Stream3).
 
@@ -352,6 +361,37 @@ small_integer_bounds_test_() ->
     [
         ?_assertEqual({-(1 bsl 59), (1 bsl 59) - 1}, jit:small_integer_bounds(jit_x86_64)),
         ?_assertEqual({-(1 bsl 27), (1 bsl 27) - 1}, jit:small_integer_bounds(jit_armv6m))
+    ].
+
+%% BEAM types format version 3 (OTP < 29). Bound/unit flags live at bits
+%% 12/13/14; type bits are 0..11.
+type_resolver_v3_test_() ->
+    IntLowerBoundEntry = <<((1 bsl 5) bor (1 bsl 12)):16, 2:64/signed>>,
+    Chunk = <<3:32, 1:32, IntLowerBoundEntry/binary>>,
+    R = jit_precompile:type_resolver(Chunk),
+    [?_assertEqual({t_integer, {2, '+inf'}}, R(0))].
+
+%% BEAM types format version 4 (OTP >= 29). v4 inserts BEAM_TYPE_RECORD at bit
+%% 12, pushing the bound/unit flags up to bits 13/14/15; type bits are 0..12.
+%% Mirrors src/libAtomVM/module.c which already handles both versions.
+type_resolver_v4_test_() ->
+    %% t_integer with lower bound 2, no upper bound.
+    IntLowerBound = <<((1 bsl 5) bor (1 bsl 13)):16, 2:64/signed>>,
+    %% t_integer with both bounds {2, 100}.
+    IntBothBounds = <<((1 bsl 5) bor (1 bsl 13) bor (1 bsl 14)):16, 2:64/signed, 100:64/signed>>,
+    %% t_bitstring with unit (HAS_UNIT at bit 15), unit byte stores unit-1.
+    BitstringUnit = <<((1 bsl 1) bor (1 bsl 15)):16, 0:8>>,
+    %% Plain atom, no extra bytes.
+    AtomEntry = <<(1 bsl 0):16>>,
+    Chunk =
+        <<4:32, 4:32, IntLowerBound/binary, IntBothBounds/binary, BitstringUnit/binary,
+            AtomEntry/binary>>,
+    R = jit_precompile:type_resolver(Chunk),
+    [
+        ?_assertEqual({t_integer, {2, '+inf'}}, R(0)),
+        ?_assertEqual({t_integer, {2, 100}}, R(1)),
+        ?_assertEqual({t_bs_matchable, 1}, R(2)),
+        ?_assertEqual(t_atom, R(3))
     ].
 
 is_small_integer_range_test_() ->

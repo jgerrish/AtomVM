@@ -101,15 +101,15 @@ extern "C" {
 #define SET_ERROR(error_type_atom)                \
     context_set_exception_class(ctx, ERROR_ATOM); \
     ctx->exception_reason = error_type_atom;      \
-    ctx->exception_stacktrace = stacktrace_create_raw(ctx, mod, (const uint8_t *) native_pc - (const uint8_t *) mod->native_code);
+    ctx->exception_stacktrace = stacktrace_create_raw(ctx, mod, (uintptr_t) native_pc - (uintptr_t) mod->native_code);
 #else
-#define SET_ERROR(error_type_atom)                                                          \
-    context_set_exception_class(ctx, ERROR_ATOM);                                           \
-    ctx->exception_reason = error_type_atom;                                                \
-    if (mod->native_code) {                                                                 \
-        ctx->exception_stacktrace = stacktrace_create_raw(ctx, mod,                         \
-            (const uint8_t *) native_pc - (const uint8_t *) mod->native_code);  \
-    } else {                                                                                \
+#define SET_ERROR(error_type_atom)                                              \
+    context_set_exception_class(ctx, ERROR_ATOM);                               \
+    ctx->exception_reason = error_type_atom;                                    \
+    if (mod->native_code) {                                                     \
+        ctx->exception_stacktrace = stacktrace_create_raw(ctx, mod,             \
+            (uintptr_t) native_pc - (uintptr_t) mod->native_code);              \
+    } else {                                                                    \
         ctx->exception_stacktrace = stacktrace_create_raw(ctx, mod, pc - code); \
     }
 #endif
@@ -123,16 +123,16 @@ extern "C" {
 #define SET_ERROR_MFA(error_type_atom, m, f, a)                 \
     context_set_exception_class_use_live_flag(ctx, ERROR_ATOM); \
     ctx->exception_reason = error_type_atom;                    \
-    ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod, (const uint8_t *) native_pc - (const uint8_t *) mod->native_code, m, f, a);
+    ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod, (uintptr_t) native_pc - (uintptr_t) mod->native_code, m, f, a);
 #else
-#define SET_ERROR_MFA(error_type_atom, m, f, a)                                                          \
-    context_set_exception_class_use_live_flag(ctx, ERROR_ATOM);                                          \
-    ctx->exception_reason = error_type_atom;                                                             \
-    if (mod->native_code) {                                                                              \
-        ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod,                                  \
-            (const uint8_t *) native_pc - (const uint8_t *) mod->native_code, m, f, a);                  \
-    } else {                                                                                             \
-        ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod, pc - code, m, f, a);             \
+#define SET_ERROR_MFA(error_type_atom, m, f, a)                                              \
+    context_set_exception_class_use_live_flag(ctx, ERROR_ATOM);                              \
+    ctx->exception_reason = error_type_atom;                                                 \
+    if (mod->native_code) {                                                                  \
+        ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod,                      \
+            (uintptr_t) native_pc - (uintptr_t) mod->native_code, m, f, a);                  \
+    } else {                                                                                 \
+        ctx->exception_stacktrace = stacktrace_create_raw_mfa(ctx, mod, pc - code, m, f, a); \
     }
 #endif
 
@@ -668,6 +668,22 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
         goto loop
 #endif
 
+// Helper to resolve saved_function_ptr to a per-thread function pointer.
+// For WASM, saved_function_ptr stores (label + 1) encoding (thread-independent).
+// For other JIT archs, it stores the actual function pointer.
+#ifndef AVM_NO_JIT
+#ifdef JIT_JUMPTABLE_IS_DATA
+#define DO_RESOLVE_SAVED_FUNC_PTR()                             \
+    {                                                           \
+        int _label = (int) ctx->saved_function_ptr - 1;         \
+        native_pc = module_get_native_entry_point(mod, _label); \
+    }
+#else
+#define DO_RESOLVE_SAVED_FUNC_PTR()                             \
+    native_pc = ctx->saved_function_ptr
+#endif
+#endif
+
 #if AVM_NO_JIT
 
 #define SCHEDULE_NEXT(restore_mod, restore_to) \
@@ -696,6 +712,15 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
 
 #elif AVM_NO_EMU
 
+#ifdef JIT_JUMPTABLE_IS_DATA
+// WASM: saved_function_ptr already has (label + 1) encoding, don't overwrite
+#define SCHEDULE_WAIT_ANY(restore_mod) \
+    {                                                                                             \
+        ctx->saved_module = restore_mod;                                                          \
+        ctx = scheduler_wait(ctx);                                                                \
+        goto schedule_in;                                                                         \
+    }
+#else
 #define SCHEDULE_WAIT_ANY(restore_mod) \
     {                                                                                             \
         ctx->saved_function_ptr = native_pc;                                                      \
@@ -703,6 +728,7 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
         ctx = scheduler_wait(ctx);                                                                \
         goto schedule_in;                                                                         \
     }
+#endif
 
 #else
 
@@ -719,9 +745,8 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
     {                                                                                             \
         if (restore_mod->native_code == NULL) {                                                   \
             ctx->saved_ip = pc;                                                                   \
-        } else {                                                                                  \
-            ctx->saved_ip = native_pc;                                                            \
         }                                                                                         \
+        /* For JIT: saved_function_ptr already has correct encoding */                            \
         ctx->saved_module = restore_mod;                                                          \
         ctx = scheduler_wait(ctx);                                                                \
         goto schedule_in;                                                                         \
@@ -747,7 +772,7 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
 #elif AVM_NO_EMU
     #define RESUME()                                            \
     {                                                           \
-        native_pc = ctx->saved_function_ptr;                    \
+        DO_RESOLVE_SAVED_FUNC_PTR();                            \
     }
 #else
     #define RESUME()                                            \
@@ -755,7 +780,7 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
         pc = (ctx->saved_ip);                                   \
         native_pc = NULL;                                       \
     } else {                                                    \
-        native_pc = ctx->saved_ip;                              \
+        DO_RESOLVE_SAVED_FUNC_PTR();                            \
     }
 #endif
 
@@ -974,6 +999,20 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
 
 #else
 
+#ifdef JIT_JUMPTABLE_IS_DATA
+static inline ModuleNativeEntryPoint do_return_native(Module *mod, Context *ctx)
+{
+    int label = (int) ((ctx->cp & 0xFFFFFF) >> 2) / JIT_JUMPTABLE_ENTRY_SIZE;
+    return module_get_native_entry_point(mod, label);
+}
+#else
+static inline ModuleNativeEntryPoint do_return_native(Module *mod, Context *ctx)
+{
+    return (ModuleNativeEntryPoint) ((const uint8_t *) mod->native_code)
+        + ((ctx->cp & 0xFFFFFF) >> 2);
+}
+#endif
+
 #define DO_RETURN()                                                     \
     {                                                                   \
         int module_index = ((uintptr_t) ctx->cp) >> 24;                 \
@@ -988,7 +1027,7 @@ static void destroy_extended_registers(Context *ctx, unsigned int live)
             code = mod->code->code;                                     \
         }                                                               \
         if (mod->native_code) {                                         \
-            native_pc = (ModuleNativeEntryPoint) ((const uint8_t *) mod->native_code) + ((ctx->cp & 0xFFFFFF) >> 2); \
+            native_pc = do_return_native(mod, ctx);                     \
         } else {                                                        \
             native_pc = NULL;                                           \
             pc = code + ((((uintptr_t) ctx->cp) & 0xFFFFFF) >> 2);      \
@@ -1588,10 +1627,18 @@ int context_execute_loop(Context *ctx, Module *mod, const char *function_name, i
     ctx->saved_ip = mod->labels[label];
 #elif AVM_NO_EMU
     assert(mod->native_code);
+#ifdef JIT_JUMPTABLE_IS_DATA
+    ctx->saved_function_ptr = (NativeContinuation) (label + 1);
+#else
     ctx->saved_function_ptr = module_get_native_entry_point(mod, label);
+#endif
 #else
     if (mod->native_code) {
+#ifdef JIT_JUMPTABLE_IS_DATA
+        ctx->saved_function_ptr = (NativeContinuation) (label + 1);
+#else
         ctx->saved_function_ptr = module_get_native_entry_point(mod, label);
+#endif
     } else {
         ctx->saved_ip = mod->labels[label];
     }
@@ -1638,7 +1685,15 @@ schedule_in:
     // set PC
     pc = (ctx->saved_ip);
 #elif AVM_NO_EMU
+#ifdef JIT_JUMPTABLE_IS_DATA
+    // WASM: saved_function_ptr stores (label + 1) encoding; resolve per-thread
+    {
+        int label = (int) ctx->saved_function_ptr - 1;
+        native_pc = module_get_native_entry_point(mod, label);
+    }
+#else
     native_pc = ctx->saved_function_ptr;
+#endif
 #else
     if (mod->native_code == NULL) {
         code = mod->code->code;
@@ -1646,7 +1701,15 @@ schedule_in:
         pc = (ctx->saved_ip);
         native_pc = NULL;
     } else {
+#ifdef JIT_JUMPTABLE_IS_DATA
+        // WASM: saved_function_ptr stores (label + 1) encoding; resolve per-thread
+        {
+            int label = (int) ctx->saved_function_ptr - 1;
+            native_pc = module_get_native_entry_point(mod, label);
+        }
+#else
         native_pc = ctx->saved_function_ptr;
+#endif
     }
 #endif
 
@@ -1670,10 +1733,13 @@ schedule_in:
         assert(native_pc);
 #endif
             struct JITState jit_state;
-            jit_state.continuation = NULL;
+            jit_state.continuation = (NativeContinuation) 0;
             jit_state.module = mod;
             jit_state.remaining_reductions = remaining_reductions;
             // __asm__ volatile("int $0x03");
+#if JIT_ARCH_TARGET == JIT_ARCH_XTENSA
+            jit_state.code_base = (const void *) mod->native_code;
+#endif
             TRACE("calling native code at %p, ctx = %p\n", (void *) native_pc, (void *) ctx);
             Context *new_ctx = native_pc(ctx, &jit_state, &module_native_interface);
             TRACE("returning from native code at %p, ctx = %p, new_ctx = %p, jit_state.continuation = %p\n", (void *) native_pc, (void *) ctx, (void *) new_ctx, (void *) jit_state.continuation);
@@ -1682,7 +1748,7 @@ schedule_in:
                 ctx = new_ctx;
                 goto schedule_in;
             }
-            if (IS_NULL_PTR(jit_state.continuation)) {
+            if (UNLIKELY(jit_state.continuation == (NativeContinuation) 0)) {
                 goto schedule_in;
             }
             if (UNLIKELY(remaining_reductions == 0)) {
@@ -1701,10 +1767,18 @@ schedule_in:
             if (mod->native_code == NULL) {
                 // set PC
                 native_pc = NULL;
-                JUMP_TO_ADDRESS(jit_state.continuation);
+                JUMP_TO_ADDRESS(jit_state.continuation_pc);
             } else {
 #endif
+#ifdef JIT_JUMPTABLE_IS_DATA
+                // WASM: continuation stores (label + 1); convert to function pointer
+                {
+                    int label = (int) jit_state.continuation - 1;
+                    native_pc = module_get_native_entry_point(mod, label);
+                }
+#else
                 native_pc = jit_state.continuation;
+#endif
 #ifndef AVM_NO_EMU
             }
 #endif
@@ -3184,6 +3258,8 @@ schedule_in:
 
                 // clears the catch value on stack
                 WRITE_REGISTER(dreg, term_nil());
+
+                context_clear_exception(ctx);
                 break;
             }
 
@@ -3242,39 +3318,42 @@ schedule_in:
 
                 WRITE_REGISTER(dreg, term_nil());
                 // C.f. https://www.erlang.org/doc/reference_manual/expressions.html#catch-and-throw
-                switch (term_to_atom_index(x_regs[0])) {
-                    case THROW_ATOM_INDEX:
-                        x_regs[0] = x_regs[1];
-                        break;
+                if (context_has_pending_exception(ctx)) {
+                    switch (term_to_atom_index(context_exception_class(ctx))) {
+                        case THROW_ATOM_INDEX:
+                            x_regs[0] = x_regs[1];
+                            break;
 
-                    case ERROR_ATOM_INDEX: {
-                        x_regs[2] = stacktrace_build(ctx, &x_regs[2], 3);
-                        // MEMORY_CAN_SHRINK because catch_end is classified as gc in beam_ssa_codegen.erl
-                        if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2) * 2, 2, x_regs + 1, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
-                            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+                        case ERROR_ATOM_INDEX: {
+                            x_regs[2] = stacktrace_build(ctx, &x_regs[2], 3);
+                            // MEMORY_CAN_SHRINK because catch_end is classified as gc in beam_ssa_codegen.erl
+                            if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2) * 2, 2, x_regs + 1, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
+                                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+                            }
+                            term reason_tuple = term_alloc_tuple(2, &ctx->heap);
+                            term_put_tuple_element(reason_tuple, 0, x_regs[1]);
+                            term_put_tuple_element(reason_tuple, 1, x_regs[2]);
+                            term exit_tuple = term_alloc_tuple(2, &ctx->heap);
+                            term_put_tuple_element(exit_tuple, 0, EXIT_ATOM);
+                            term_put_tuple_element(exit_tuple, 1, reason_tuple);
+                            x_regs[0] = exit_tuple;
+
+                            break;
                         }
-                        term reason_tuple = term_alloc_tuple(2, &ctx->heap);
-                        term_put_tuple_element(reason_tuple, 0, x_regs[1]);
-                        term_put_tuple_element(reason_tuple, 1, x_regs[2]);
-                        term exit_tuple = term_alloc_tuple(2, &ctx->heap);
-                        term_put_tuple_element(exit_tuple, 0, EXIT_ATOM);
-                        term_put_tuple_element(exit_tuple, 1, reason_tuple);
-                        x_regs[0] = exit_tuple;
+                        case LOWERCASE_EXIT_ATOM_INDEX: {
+                            // MEMORY_CAN_SHRINK because catch_end is classified as gc in beam_ssa_codegen.erl
+                            if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2), 1, x_regs + 1, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
+                                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+                            }
+                            term exit_tuple = term_alloc_tuple(2, &ctx->heap);
+                            term_put_tuple_element(exit_tuple, 0, EXIT_ATOM);
+                            term_put_tuple_element(exit_tuple, 1, x_regs[1]);
+                            x_regs[0] = exit_tuple;
 
-                        break;
-                    }
-                    case LOWERCASE_EXIT_ATOM_INDEX: {
-                        // MEMORY_CAN_SHRINK because catch_end is classified as gc in beam_ssa_codegen.erl
-                        if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2), 1, x_regs + 1, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
-                            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+                            break;
                         }
-                        term exit_tuple = term_alloc_tuple(2, &ctx->heap);
-                        term_put_tuple_element(exit_tuple, 0, EXIT_ATOM);
-                        term_put_tuple_element(exit_tuple, 1, x_regs[1]);
-                        x_regs[0] = exit_tuple;
-
-                        break;
                     }
+                    context_clear_exception(ctx);
                 }
                 break;
             }
@@ -5245,9 +5324,11 @@ schedule_in:
 
                 TRACE("raw_raise/0\n");
 
-                // This is an optimization from the compiler where we don't need to call
-                // stacktrace_create_raw here because the stack trace has already been created
-                // and set in x[2].
+                // The compiler emits raw_raise for erlang:raise/3 calls.
+                // x_regs[2] may hold a built stacktrace (list of {M,F,A,Loc}
+                // tuples). We use HANDLE_ERROR() instead of a bare goto so
+                // stacktrace_create_raw_mfa wraps it into a raw 6-tuple that
+                // OP_RAISE can later process.
                 term ex_class = x_regs[0];
                 if (UNLIKELY(ex_class != ERROR_ATOM && ex_class != LOWERCASE_EXIT_ATOM && ex_class != THROW_ATOM)) {
                     x_regs[0] = BADARG_ATOM;
@@ -5255,7 +5336,7 @@ schedule_in:
                     context_set_exception_class(ctx, x_regs[0]);
                     ctx->exception_reason = x_regs[1];
                     ctx->exception_stacktrace = x_regs[2];
-                    goto handle_error;
+                    HANDLE_ERROR();
                 }
                 break;
             }
@@ -6204,6 +6285,43 @@ schedule_in:
                     break;
                 }
 #endif
+
+                case OP_NIF_START: {
+                    TRACE("nif_start/0\n");
+                    break;
+                }
+
+#if MAXIMUM_OTP_COMPILER_VERSION >= 27
+                case OP_EXECUTABLE_LINE: {
+                    term location;
+                    DECODE_COMPACT_TERM(location, pc);
+                    uint32_t line_number;
+                    DECODE_LITERAL(line_number, pc);
+
+                    TRACE("executable_line/2 location=0x%" TERM_X_FMT ", line=%u\n", location, line_number);
+
+                    USED_BY_TRACE(location);
+                    break;
+                }
+#endif
+
+#if MAXIMUM_OTP_COMPILER_VERSION >= 28
+                case OP_DEBUG_LINE: {
+                    term kind;
+                    DECODE_COMPACT_TERM(kind, pc);
+                    uint32_t location_index;
+                    DECODE_LITERAL(location_index, pc);
+                    uint32_t index;
+                    DECODE_LITERAL(index, pc);
+                    uint32_t live;
+                    DECODE_LITERAL(live, pc);
+
+                    TRACE("debug_line/4 kind=0x%" TERM_X_FMT ", location=%u, index=%u, live=%u\n", kind, location_index, index, live);
+
+                    USED_BY_TRACE(kind);
+                    break;
+                }
+#endif
             }
 
             default:
@@ -6227,9 +6345,6 @@ schedule_in:
         x_regs[0] = context_exception_class(ctx);
         x_regs[1] = ctx->exception_reason;
         x_regs[2] = ctx->exception_stacktrace;
-        context_set_exception_class(ctx, term_nil());
-        ctx->exception_reason = term_nil();
-        ctx->exception_stacktrace = term_nil();
 
         int target_label = context_get_catch_label(ctx, &mod);
         if (target_label) {

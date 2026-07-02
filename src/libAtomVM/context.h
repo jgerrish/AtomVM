@@ -122,7 +122,7 @@ struct Context
         const void *saved_ip;
 #endif
 #ifndef AVM_NO_JIT
-        ModuleNativeEntryPoint saved_function_ptr;
+        NativeContinuation saved_function_ptr;
 #endif
     };
     // pointer to a trap or wait timeout handler
@@ -648,6 +648,18 @@ static inline void context_set_exception_class_use_live_flag(Context *ctx, term 
 static inline bool context_exception_class_has_live_regs_flag(const Context *ctx)
 {
     return (ctx->exception_class & EXCEPTION_USE_LIVE_REGS_FLAG) != 0;
+}
+
+static inline bool context_has_pending_exception(const Context *ctx)
+{
+    return ctx->exception_class != 0;
+}
+
+static inline void context_clear_exception(Context *ctx)
+{
+    ctx->exception_class = 0;
+    ctx->exception_reason = term_nil();
+    ctx->exception_stacktrace = term_invalid_term();
 }
 
 #ifdef __cplusplus

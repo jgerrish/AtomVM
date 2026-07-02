@@ -25,6 +25,9 @@ include(BuildErlang)
 set(ERLANG_MODULES
     gpio
     i2c
+    spi
+    uart
+    usb_cdc
 )
 
 pack_archive(avm_stm32 DEPENDS_ON eavmlib ERLC_FLAGS +warnings_as_errors MODULES ${ERLANG_MODULES})

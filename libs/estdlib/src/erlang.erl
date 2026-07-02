@@ -55,6 +55,8 @@
     loaded/0,
     module_loaded/1,
     display/1,
+    display_string/1,
+    display_string/2,
     list_to_atom/1,
     list_to_existing_atom/1,
     list_to_binary/1,
@@ -360,6 +362,10 @@ process_info(_Pid, _Key) ->
 %%      <li><b>esp32_largest_free_block</b> the number of the largest contiguous free bytes in the ESP32 heap (integer)</li>
 %%      <li><b>esp32_minimum_free_size</b> the smallest number of free bytes in the ESP32 heap since boot (integer)</li>
 %%      <li><b>esp32_chip_info</b> Details about the model and capabilities of the ESP32 device (map)</li>
+%% </ul>
+%% The following keys are supported on the STM32 platform:
+%% <ul>
+%%      <li><b>stm32_chip_info</b> Details about the model and capabilities of the STM32 device (map)</li>
 %% </ul>
 %%
 %% Additional keys may be supported on some platforms that are not documented here.
@@ -697,6 +703,14 @@ module_loaded(_Module) ->
 %%-----------------------------------------------------------------------------
 -spec display(Term :: any()) -> true.
 display(_Term) ->
+    erlang:nif_error(undefined).
+
+-spec display_string(String :: string() | binary()) -> true.
+display_string(_String) ->
+    erlang:nif_error(undefined).
+
+-spec display_string(Device :: stdout | stderr, String :: string() | binary()) -> true.
+display_string(_Device, _String) ->
     erlang:nif_error(undefined).
 
 %%-----------------------------------------------------------------------------

@@ -4,21 +4,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0-alpha.1] - Unreleased
+## [0.7.0-beta.0] - Unreleased
 
 ### Added
+- Added Erlang distribution over serial (uart)
+- Added WASM32 JIT backend for Emscripten platform
+- Added `network:wifi_scan/0,1` to ESP32 network driver to scan available APs when in sta or sta+ap mode.
+- Added support for `nif_start`, `executable_line` and `debug_line` opcodes
+- Added named variable debugging support in DWARF when modules are compiled with `beam_debug_info`
+- Added more reset reasons and ensured `esp:reset_reason/0` doesn't return `undefined`
+- Added I2C, SPI and UART APIs to stm32 platform
+- Added `Transfer-Encoding: chunked` response support to `ahttp_client`, including HTTP trailers
+- Added `proc_lib:init_fail/2,3`
+- Added UART API to rp2 platform
+- Added `"USB_SERIAL_JTAG"` peripheral to the ESP32 `uart` module on chips with a built-in
+  USB-Serial-JTAG controller (C3/C5/C6/C61/H2/H21/H4/P4/S3)
+- Added support for the `safe` option in `erlang:binary_to_term/2`
+- Added xtensa JIT backend for esp32 platform
+- Added support for configuring pins and width for sdmmc on ESP32
+- Added support for map comprehensions
+- Added USB CDC port drivers for ESP32, RP2, and STM32 platforms
+
+### Changed
+- Updated network type db() to dbm() to reflect the actual representation of the type
+- Use ES6 modules for emscripten port, using .mjs suffix
+- `ahttp_client` now returns `{error, {parser, incomplete_response}}` when a socket closes mid-response
+  (previously silently reported `closed`); `ssl_closed` messages are also handled
+- `ahttp_client` now returns `{error, {parser, {conflicting_content_length, V}}}` when a response
+  carries differing `Content-Length` values (previously silently accepted the last one),
+  per RFC 9112 §6.3
+- `ahttp_client` now emits a `done` event for responses with `Content-Length: 0` (previously
+  the parser stayed in `body` state forever, hanging passive callers and misflagging legitimate
+  close as `incomplete_response`)
+- `ahttp_client` now discards bytes past `Content-Length` and transitions to `done` (previously
+  emitted the excess as body data and stalled the parser when the socket delivered more than
+  the promised byte count)
+- `ahttp_client` now caps parsed status, header and chunk-size lines at 16 KiB (`?MAX_LINE_SIZE`);
+  longer lines return `{error, {parser, {line_too_long, Prefix}}}` with the first 128 bytes of
+  the offending line. Callers whose upstream servers emit unusually large headers must account
+  for this limit
+
+### Removed
+- Removed `ahttp_client` support for obsolete line folding (RFC 9112 §5.2); folded header and
+  trailer lines now return `{error, {parser, deprecated_obs_fold}}`, and the
+  `header_continuation` / `trailer_header_continuation` response events are no longer emitted
+
+### Fixed
+- Stop using deprecated `term_from_int32` on STM32 platform
+- Stop using deprecated `term_from_int32` on RP2 platform
+- Stop using deprecated `term_from_int32` on ESP32 platform
+- Fixed improper cast of ESP32 `event_data` for `WIFI_EVENT_AP_STA(DIS)CONNECTED` events
+- `erlang:system_info(system_architecture)` now reports normalized `arch-vendor-os` strings
+- Fixed `ahttp_client` crash on non-numeric or negative `Content-Length` values
+- Fixed `ahttp_client` crash on headers with empty or all-whitespace values
+- Fixed a bug in `supervisor` handling of failing child
+- Fixed two bugs related to closing fds in `atomvm:subprocess/4`
+- Fixed `erlang:localtime/1` memory leak, use-after-free, and TZ restore bugs on newlib/picolibc
+- Fixed ESP32 I2C driver resource leaks, half-closed state, and close-during-transmission errors
+- Fixed several underallocation issues that could trigger data corruption on `binary:replace`, `zlib:compress` and bsd socket recv code.
+- Fixed a bug where `catch` would raise on regular atom results
+- Fixed ESP32 socket driver holding the global socket-list lock across blocking TCP connects, leaking the port on connect failure, losing concurrent `accept` waiters, leaking `netbuf` on receive error paths, and a recycled-`netconn` race between socket close and the event handler
+
+## [0.7.0-alpha.1] - 2026-04-06
+
+### Added
+- Added `json` module to estdlib, compatible with Erlang/OTP `json` API
+- Added `Keyword.put_new/3` to exavmlib
+- Added `JSON` module to exavmlib (Elixir wrapper for estdlib `json`)
 - Added `erlang:node/1` BIF
 - Added `erts_internal:cmp_term/2`
 - Added `short` option to `erlang:float_to_binary/2` and `erlang:float_to_list/2`
 - Added generic unix support for uart using POSIX nifs
 - Added RISC-V 64-bit (RV64IMAC) JIT backend
+- Added arm32 JIT backend
 - Added DWARF debug information support for JIT-compiled code
+- Added I2C and SPI APIs to rp2 platform
+- Added `code:get_object_code/1`
+- Added `erlang:display_string/1` and `erlang:display_string/2`
+- Added Thumb-2 support to armv6m JIT backend, optimizing code for ARMv7-M and later cores
+- Added support for `binary:split/2,3` list patterns and `trim` / `trim_all` options
+- Added `timer:send_after/2`, `timer:send_after/3` and `timer:apply_after/4`
 
 ### Changed
 - ~10% binary size reduction by rewriting module loading logic
 - `erlang:float_to_binary/2` and `erlang:float_to_list/2` now accept `{decimals, 0..253}` and `{scientific, 0..249}`
 - `erlang:binary_to_float/1` and `erlang:list_to_float/1` now use locale-independent parsing and
 strict format validation
+- ESP32: the `boot.avm` partition for Erlang-only images has been increased from 256KB to 512KB,
+matching the Elixir partition layout. The `main.avm` offset is now `0x250000` for all images
+(previously `0x210000` for Erlang-only).
 
 ### Fixed
 - Fixed `erlang:cancel_timer/1` return type spec and documentation to match OTP
@@ -27,6 +101,12 @@ strict format validation
 - Fixed locale-dependent decimal separator in `erlang:float_to_binary` and `erlang:float_to_list`
 - Fixed `erlang:binary_to_float/1` and `erlang:list_to_float/1` returning `inf` for overflow instead
 of raising `badarg`
+- Fixed `erlang:raise/3` with a built stacktrace causing an assertion failure when the re-raised
+exception passes through a non-matching catch clause
+
+### Removed
+- Removed support for OTP versions < 26
+- Removed old `json_encoder` module (now standard Erlang/OTP `json` module is available)
 
 ## [0.7.0-alpha.0] - 2026-03-20
 
@@ -159,10 +239,6 @@ table.
 - ESP32 ports now flash a complete working image using the `idf.py flash` task.
 - ESP32 platform now uses reproducible builds.
 - C API: `externalterm` module was renamed to `external_term` and it has a completely new API
-
-### Removed
-
-- Removed support for OTP versions < 26
 
 ### Fixed
 
@@ -694,6 +770,7 @@ functions that default to `?ATOMVM_NVS_NS` are deprecated now).
 - Fixed numerous bugs in memory allocations that could crash the VM
 - Fixed SNTP support that had been broken in IDF 4.x builds
 - Fixed `erlang:send/2` not sending to registered name
+- Fixed sign of `binary:at/2`, `binary:first/1` and `binary:last/1` results
 
 ### Breaking Changes
 

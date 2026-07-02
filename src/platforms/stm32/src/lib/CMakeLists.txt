@@ -21,6 +21,26 @@
 cmake_minimum_required (VERSION 3.13)
 project (libAtomVMPlatformSTM32)
 
+if (STM32_HAS_RNG)
+    # Skip mbedTLS programs/tests that pull in POSIX-only code (sockets,
+    # stdio, etc.) and won't link on bare metal anyway.
+    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+
+    include(FetchMbedTLS)
+
+    # Apply our user config only to the mbedtls targets, not to the rest
+    # of the firmware.
+    set(_mbedtls_stm32_cfg "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/mbedtls_stm32_user_config.h\"")
+    foreach(_tgt mbedcrypto mbedtls mbedx509)
+        if(TARGET ${_tgt})
+            target_compile_definitions(${_tgt} PRIVATE "${_mbedtls_stm32_cfg}")
+        endif()
+    endforeach()
+    unset(_mbedtls_stm32_cfg)
+    unset(_tgt)
+endif()
+
 set(HEADER_FILES
     avm_devcfg.h
     avm_log.h
@@ -34,11 +54,25 @@ set(HEADER_FILES
 set(SOURCE_FILES
     gpio_driver.c
     i2c_driver.c
+    spi_driver.c
+    uart_driver.c
     jit_stream_flash.c
     platform_nifs.c
     sys.c
     ../../../../libAtomVM/portnifloader.c
 )
+
+if (STM32_HAS_RNG)
+    list(APPEND HEADER_FILES
+        ../../../../libAtomVM/otp_crypto.h)
+    list(APPEND SOURCE_FILES
+        ../../../../libAtomVM/otp_crypto.c
+        otp_crypto_platform.c)
+endif()
+
+if (AVM_USB_CDC_PORT_DRIVER_ENABLED)
+    list(APPEND SOURCE_FILES usb_cdc_driver.c usb_descriptors.c usb_irq_handlers.c usb_hw_init.c)
+endif()
 
 set(
     PLATFORM_LIB_SUFFIX
@@ -52,6 +86,12 @@ if(CMAKE_COMPILER_IS_GNUCC)
 endif()
 
 target_link_libraries(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC libAtomVM)
+if (STM32_HAS_RNG)
+    target_compile_definitions(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC ATOMVM_HAS_MBEDTLS)
+    target_compile_definitions(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC
+        "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/mbedtls_stm32_user_config.h\"")
+    target_link_libraries(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC MbedTLS::mbedcrypto)
+endif()
 target_link_options(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC ${LINK_OPTIONS} -Wl,--whole-archive ${CMAKE_CURRENT_BINARY_DIR}/liblibAtomVMGeneric-arm.a -Wl,--no-whole-archive)
 
 # Include HAL/CMSIS headers
@@ -65,3 +105,16 @@ target_include_directories(libAtomVM${PLATFORM_LIB_SUFFIX} SYSTEM PUBLIC
 target_include_directories(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC
     "${CMAKE_BINARY_DIR}/generated"
 )
+
+if (AVM_USB_CDC_PORT_DRIVER_ENABLED)
+    target_compile_definitions(libAtomVM${PLATFORM_LIB_SUFFIX} PRIVATE
+        AVM_USB_CDC_PORT_DRIVER_ENABLED
+        USBD_VID=${AVM_USB_CDC_VID}
+        USBD_PID=${AVM_USB_CDC_PID}
+        "USBD_MANUFACTURER=\"${AVM_USB_CDC_MANUFACTURER}\""
+        "USBD_PRODUCT=\"${AVM_USB_CDC_PRODUCT}\""
+        "USBD_INTERFACE_NAME=\"${AVM_USB_CDC_INTERFACE_NAME}\""
+    )
+    target_link_libraries(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC tinyusb_device)
+    target_link_options(libAtomVM${PLATFORM_LIB_SUFFIX} PUBLIC "SHELL:-Wl,-u -Wl,usb_cdcregister_port_driver")
+endif()

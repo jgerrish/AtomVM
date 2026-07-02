@@ -245,6 +245,13 @@ GlobalContext *globalcontext_new(void)
 
 COLD_FUNC void globalcontext_destroy(GlobalContext *glb)
 {
+#ifndef AVM_NO_SMP
+    /* Join sub-threads: a thread may still execute JIT epilogue code after
+     * decrementing running_schedulers, so we must join before munmapping
+     * native code pages. */
+    smp_scheduler_join_all();
+#endif
+
     sys_free_platform(glb);
 
     struct ListHead *item;
@@ -658,13 +665,8 @@ bool globalcontext_is_atom_index_equal_to_atom_string(GlobalContext *glb, atom_i
 
 term globalcontext_existing_term_from_atom_string(GlobalContext *glb, AtomString atom_string)
 {
-    atom_index_t global_atom_index;
-    enum AtomTableEnsureAtomResult ensure_result = atom_table_ensure_atom(
-        glb->atom_table, atom_string_data(atom_string), atom_string_len(atom_string), AtomTableAlreadyExisting, &global_atom_index);
-    if (UNLIKELY(ensure_result != AtomTableEnsureAtomOk)) {
-        return term_invalid_term();
-    }
-    return term_from_atom_index(global_atom_index);
+    return globalcontext_existing_atom_from_buf(
+        glb, atom_string_data(atom_string), atom_string_len(atom_string));
 }
 
 int globalcontext_insert_module(GlobalContext *global, Module *module)
